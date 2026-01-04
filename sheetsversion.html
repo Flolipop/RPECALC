@@ -1,0 +1,2224 @@
+<!DOCTYPE html>
+<!--
+File: /c:/Users/flo/Documents/sheetsversion.html
+Purpose:
+    - Single-file web UI for viewing and interacting with a Google Sheets‑backed training program (Smart RPE Pro).
+    - Presents weekly navigation, per-day collapsible workouts, progress tracking, and program analysis charts (Squat, Bench, Deadlift).
+    - Supports entering "actual" lifts, checking sets as completed, viewing plate breakdowns, and persisting session history locally.
+
+Quick configuration:
+    - Set SHEET_ID and API_KEY constants near the top of the script to connect to your Google Sheets data.
+        * Do NOT commit API keys to public repos; prefer server-side proxy or environment variables for production.
+    - Rounding behavior selectable via the #roundingMode select (nearest / up / down).
+
+High-level structure:
+    - CSS variables (under :root) define theme colors, component backgrounds, progress bar colors and danger/active highlights.
+    - Layout:
+        * .navbar: top controls (Graphs/History).
+        * .week-nav: horizontal week selector buttons.
+        * .main-grid: two-column layout with left sidebar (maxes, rounding, reset) and right content (workouts or graphs).
+        * #workoutDisplay: main area where workouts are rendered.
+        * #graphView: separate layout for charts (sqChart, bpChart, dlChart).
+    - Modals:
+        * #plateModal: visual plate breakdown for a selected weight.
+        * #historyModal: session history viewer; stored in localStorage key 'workout_history'.
+
+Styling & responsiveness:
+    - Uses a compact responsive grid; switches to a single column under 900px.
+    - Custom components: card, workout-section (collapsible), progress bars, check circles, loader spinner.
+    - Accessibility considerations:
+        * Buttons and controls use visible focusable areas, but consider adding ARIA roles and keyboard handlers for collapsible sections and modal focus trapping.
+
+Data model & runtime globals:
+    - RPE_CHART: local conversion table mapping RPE and reps to a multiplier (used for intensity calculations).
+    - Globals declared:
+        * activeTab: currently selected week/day identifier.
+        * allTabNames: array of week/day names.
+        * fullProgramCache: in-memory cache for parsed program data from the sheet.
+        * charts: container for Chart.js instances keyed by chart id.
+    - Chart.js defaults are set for interaction (index mode, non-intersecting).
+
+Expected behaviors (functions referenced in HTML):
+    - toggleGraphView(): switch between workout list and graph analysis view.
+    - showHistory(): open #historyModal and populate #historyLogs from localStorage.
+    - recalculateAll(): re-run rounding/weight calculations when rounding mode or maxes change.
+    - resetChecks(): clear all per-week "checked/completed" set markers.
+    - Plate modal: clicking a weight display opens #plateModal with a visual plate stack for that weight.
+    - Workout checkboxes / check-circle UI: toggles completion and triggers progress bar updates and history saves.
+
+Persistence & history:
+    - Session history is saved into localStorage (key: 'workout_history').
+    - "Clear History" removes that localStorage key and refreshes the view.
+
+Security & operational notes:
+    - Avoid embedding API_KEY in client-side code for production; use a server-side endpoint to sign requests or proxy calls.
+    - Google Sheets APIs may require CORS and correct API key / access permissions on the spreadsheet.
+    - Add error handling around network requests (timeouts, auth errors) and graceful UI fallbacks if the sheet cannot be read.
+
+Extending the app:
+    - Add additional charts by creating new canvas elements and registering Chart.js datasets into charts[].
+    - Support additional lifts or program metadata by extending parsing logic that maps sheet rows to the app's internal program format (cached in fullProgramCache).
+    - Improve accessibility: keyboard navigation for week buttons, focus trapping inside modals, and ARIA attributes for dynamic content.
+
+Debugging tips:
+    - Inspect fullProgramCache in console to verify parsed sheet data structure.
+    - Check charts object to access Chart instances for dataset inspection/updating.
+    - Watch network requests in the browser devtools to verify sheet fetches and API key usage.
+
+License & attribution:
+    - This file includes custom UI/CSS and uses Chart.js (external library). Follow Chart.js license and any other third-party license requirements when redistributing.
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>RPE CALC</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --primary: #3b82f6; --bg: #0f172a; --card-bg: #1e293b; --backoff-bg: #162032;
+            --text: #f8fafc; --text-muted: #94a3b8; --border: #334155; --input-bg: #0f172a;
+            --highlight: #22c55e; --danger: #ef4444; --active-tab: #2563eb;
+            --prog-low: #ef4444; --prog-mid: #eab308; --prog-high: #22c55e;
+        }
+        /* Light theme (alternative) */
+        .theme-light {
+            --bg: #f8fafc; --card-bg: #ffffff; --text: #0f172a; --text-muted: #475569; --border: #e2e8f0; --input-bg: #f1f5f9;
+            --primary: #2563eb; --highlight: #16a34a; --prog-low: #ef4444; --prog-mid: #f59e0b; --prog-high: #16a34a;
+        }
+        /* Muted/solarized-like theme */
+        .theme-solar {
+            --bg: #03202b; --card-bg: #073744; --text: #e6f6f9; --text-muted: #8fb3bd; --border: #0b4a58; --input-bg: #072630;
+            --primary: #0ea5a4; --highlight: #ffd166; --prog-low: #ff6b6b; --prog-mid: #f59e0b; --prog-high: #22c55e;
+        }
+        .theme-dusk {
+            --bg: #050a1b; --card-bg: #0f1a32; --text: #f1f5f9; --text-muted: #94a3b8; --border: #1e293b; --input-bg: #0a1430;
+            --primary: #6366f1; --highlight: #f472b6; --prog-low: #fb7185; --prog-mid: #fbbf24; --prog-high: #34d399;
+        }
+        .theme-forest {
+            --bg: #02150f; --card-bg: #0c2a1f; --text: #e2f7ef; --text-muted: #8dcfb6; --border: #134032; --input-bg: #072219;
+            --primary: #22c55e; --highlight: #86efac; --prog-low: #ef4444; --prog-mid: #f4a261; --prog-high: #2dd4bf;
+        }
+        .theme-neon {
+            --bg: #050505; --card-bg: #121212; --text: #fdfdfe; --text-muted: #a5b4fc; --border: #27272a; --input-bg: #0c0c0c;
+            --primary: #ec4899; --highlight: #22d3ee; --prog-low: #f97316; --prog-mid: #38bdf8; --prog-high: #a855f7;
+        }
+
+        body { font-family: -apple-system, system-ui, sans-serif; background-color: var(--bg); color: var(--text); padding: 1rem; max-width: 1200px; margin: 0 auto; padding-bottom: 4rem; }
+
+        /* Navigation */
+        .week-nav { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 10px; margin-bottom: 1.5rem; scrollbar-width: none; }
+        .week-nav::-webkit-scrollbar { display: none; }
+        .week-btn { background: var(--card-bg); color: var(--text-muted); border: 1px solid var(--border); padding: 0.75rem 1.5rem; border-radius: 8px; cursor: pointer; white-space: nowrap; font-weight: 600; transition: 0.2s; flex: 1; text-align: center; min-width: 100px; }
+        .week-btn.active { background: var(--active-tab); color: white; border-color: var(--active-tab); box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4); }
+
+        .navbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; gap: 1rem; flex-wrap: wrap; }
+        /* small helper to group header buttons */
+        .top-nav-buttons { display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+        .top-nav-buttons button { flex:0 1 auto; min-width:0; }
+
+        /* Main Layout
+           - default: sidebar hidden -> single column
+           - when .sidebar-open is present on .main-grid, show two columns */
+        .main-grid { display: grid; grid-template-columns: 1fr; gap: 2rem; align-items: start; transition: grid-template-columns 220ms ease; }
+        .main-grid.sidebar-open { grid-template-columns: 280px 1fr; }
+        .sidebar-wrapper { display: none; } /* hidden by default */
+        .main-grid.sidebar-open .sidebar-wrapper { display: block; position: sticky; top: 20px; align-self: start; }
+
+        @media (max-width: 900px) { .main-grid { grid-template-columns: 1fr; gap: 1rem; } .sidebar-wrapper { position: static; } #statsContainer { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; } }
+
+        .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
+        h2 { font-size: 1rem; margin-top: 0; color: var(--primary); margin-bottom: 1rem; }
+
+        /* GRAPH CONTAINER */
+        #graphView { display: none; }
+        .chart-container { position: relative; height: 300px; width: 100%; margin-bottom: 1rem; }
+
+        /* COLLAPSIBLE SECTIONS */
+        .workout-section { margin-bottom: 1rem; background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; transition: all 0.3s ease; }
+        .day-header {
+            background: rgba(59, 130, 246, 0.15); padding: 1rem;
+            font-weight: 800; font-size: 1.1rem; color: var(--primary);
+            user-select: none; display: flex; flex-direction: column; gap: 0.65rem;
+        }
+        .day-header:hover { background: rgba(59, 130, 246, 0.25); }
+        .header-top { display: flex; align-items: center; gap: 12px; width: 100%; }
+        .header-content { display: flex; align-items: center; gap: 10px; flex: 1 1 auto; cursor: pointer; }
+    /* header-right removed (no longer used) */
+        .arrow { transition: transform 0.3s ease; font-size: 0.8rem; margin-right: 10px; }
+        
+    /* progress indicator stacked beneath header text */
+    .progress-wrapper { width: 100%; display: flex; align-items: center; gap: 10px; padding: 0 4px; box-sizing: border-box; }
+        .progress-container { flex: 1 1 auto; height: 8px; background: var(--bg); border-radius: 10px; overflow: hidden; position: relative; }
+        .progress-bar { height: 100%; width: 0%; background: var(--prog-low); transition: width 0.35s ease, background-color 0.35s ease; }
+        /* inline numeric percentage, right-aligned so digits line up across rows */
+        .progress-label { font-size: 0.8rem; color: var(--text-muted); margin: 0; display: inline-block; min-width: 36px; text-align: right; }
+
+        /* Responsive: shrink progress width on small screens and stack right controls */
+        @media (max-width: 600px) {
+            /* allow progress area to shrink on smaller screens while keeping label inline */
+            .progress-wrapper { width: 100%; min-width: 0; flex: 1 1 auto; }
+            .progress-label { margin-bottom: 0; }
+        }
+        
+        .check-all-btn { font-size: 0.8rem; color: var(--text-muted); text-decoration: underline; cursor: pointer; z-index: 10; padding: 5px 8px; border-radius: 6px; white-space: nowrap; transition: color 0.2s ease; margin-left: auto; }
+        .check-all-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+        
+        .workout-section.collapsed .content { display: none; }
+        .workout-section.collapsed .day-header { border-bottom: none; }
+        .workout-section.collapsed .arrow { transform: rotate(-90deg); }
+        .workout-section:not(.collapsed) .day-header { border-bottom: 1px solid var(--border); }
+        .workout-section:not(.collapsed) .arrow { transform: rotate(0deg); }
+        .content { animation: fadeIn 0.3s ease; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        
+        table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 10px;}
+        th, td { padding: 0.8rem 0.5rem; text-align: left; border-bottom: 1px solid var(--border); }
+        th { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; }
+
+        .ramp-row td { border-bottom: none !important; padding-bottom: 0.2rem; }
+        .ramp-last-row td { border-bottom: 1px solid var(--border) !important; padding-bottom: 0.8rem; }
+        .ramp-row + .ramp-row td { padding-top: 0.2rem; }
+        .backoff-row { background-color: var(--backoff-bg); }
+        .completed { opacity: 0.35; filter: grayscale(1); }
+
+        .load-cell { font-size: 1.3rem; font-weight: 800; color: var(--highlight); cursor: pointer; text-decoration: underline dotted; }
+        .actual-input { width: 65px !important; text-align: center; font-weight: bold; border: 1px solid var(--border); border-radius: 4px; background: var(--input-bg); color: white; padding: 0.3rem; }
+        .timer-controls { display:flex; flex-direction:row; align-items:center; gap:10px; margin-top:6px; flex-wrap:wrap; }
+        .timer-display { font-size:1.2rem; font-weight:700; letter-spacing:1px; min-width:72px; text-align:center; }
+        .timer-btns { display:flex; gap:6px; flex-wrap:wrap; }
+        .timer-btn { flex:1; padding:0.35rem 0.5rem; background:var(--card-bg); border:1px solid var(--border); color:var(--text); border-radius:6px; cursor:pointer; font-size:0.8rem; font-weight:600; }
+        .timer-btn.primary { background:var(--primary); border-color:var(--primary); color:white; }
+        .timer-btn.secondary { color:var(--text-muted); }
+        .strength-field { display:flex; flex-direction:column; gap:4px; width:100%; }
+        .strength-slider { display:none; width:100%; accent-color: var(--primary); }
+        .strength-slider-label { display:none; font-size:0.75rem; color:var(--text-muted); }
+        .target-cell { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+        .target-cell .target-label { font-size:0.85rem; }
+        .target-cell .load-cell { flex-shrink:0; }
+        .cell-done, .cell-exercise, .cell-target, .cell-actual { vertical-align: top; }
+        .cell-done::before, .cell-exercise::before, .cell-target::before, .cell-actual::before { font-weight: 600; letter-spacing: 0.04em; color: var(--text-muted); display: none; }
+        /* Mobile-first tweaks */
+        @media (max-width: 720px) {
+            body { padding: 0.85rem; }
+            .navbar { flex-direction: column; align-items: flex-start; width: 100%; }
+            .top-nav-buttons { width: 100%; gap: 8px; }
+            .top-nav-buttons button { flex: 1 1 calc(50% - 8px); min-width: 0; }
+            .progress-wrapper { width: 100%; padding: 0; }
+            .progress-label { margin-bottom: 0; }
+            .week-nav { gap: 6px; margin-bottom: 1rem; }
+            .week-btn { flex: unset; padding: 0.6rem 1rem; font-size: 0.9rem; }
+            .progress-wrapper { flex: 1 1 auto; min-width: 0; width: 100%; margin-left: 0; }
+            .progress-container { width: 100%; }
+            .day-header { gap: 0.6rem; }
+            .timer-controls { gap: 6px; }
+            .timer-btns { width: auto; }
+            .timer-btn { flex: 1 1 auto; min-width: 90px; }
+            .strength-field select { display:none; }
+            .strength-slider, .strength-slider-label { display:block; }
+        }
+        @media (max-width: 580px) {
+            table, thead, tbody, th, td { display: block; }
+            thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+            tbody { display: flex; flex-direction: column; gap: 0.7rem; }
+            tr { background: rgba(15,23,42,0.45); border: 1px solid var(--border); border-radius: 14px; padding: 0.9rem 1rem; display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "exercise target" "actual done"; column-gap: 0.9rem; row-gap: 0.45rem; }
+            tr td { border: none; padding: 0; }
+            .cell-exercise { grid-area: exercise; }
+            .cell-target { grid-area: target; text-align: right; align-self: stretch; }
+            .cell-actual { grid-area: actual; }
+            .cell-done { grid-area: done; justify-self: flex-end; align-self: flex-start; }
+            .cell-done::before, .cell-exercise::before, .cell-target::before, .cell-actual::before {
+                display: block;
+                content: attr(data-label);
+                text-transform: uppercase;
+                font-size: 0.65rem;
+                margin-bottom: 0.1rem;
+            }
+            .cell-target::before { text-align: right; }
+            .target-cell { flex-direction: column; align-items: flex-end; gap: 0.15rem; }
+            .target-cell .target-label { width: 100%; text-align: right; }
+            .actual-input { width: 100%; max-width: none; }
+            .cell-actual .strength-field { margin-top: 0.35rem; }
+            .cell-done::before { text-align: right; }
+        }
+    /* Sidebar max input tweak */
+    .max-input { width: 90px !important; font-weight: 700; }
+        /* Preference selects styling to match inputs */
+        .pref-select { background: var(--input-bg); color: var(--text); border: 1px solid var(--border); padding: 0.4rem 0.5rem; border-radius: 6px; }
+        .pref-select.small { font-size: 0.85rem; padding: 0.35rem 0.4rem; }
+        .pref-input { width: 100%; background: var(--input-bg); color: var(--text); border: 1px solid var(--border); padding: 0.45rem 0.5rem; border-radius: 6px; font-size: 0.95rem; }
+        .settings-row { display:flex; flex-wrap:wrap; gap:10px; }
+        .settings-row > div { flex:1; min-width:120px; }
+        
+        .check-circle { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: 0.1s; }
+    .check-circle:focus { outline: 3px solid rgba(34,197,94,0.25); box-shadow: 0 0 0 3px rgba(34,197,94,0.12); }
+    .actual-input:focus { outline: 2px solid rgba(59,130,246,0.2); box-shadow: 0 0 0 3px rgba(37,99,235,0.06); }
+        .check-circle.checked { background: var(--highlight); border-color: var(--highlight); }
+        .check-circle.checked::after { content: "✓"; color: white; font-weight: bold; }
+
+        .btn-finish { width: 100%; padding: 1.2rem; background: var(--highlight); border: none; color: white; font-weight: 800; cursor: pointer; font-size: 1rem; margin-top: -1px; }
+        
+        /* Modals */
+        .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.85); z-index: 1000; display: none; justify-content: center; align-items: center; }
+        .modal-content { background: var(--card-bg); padding: 2rem; border-radius: 12px; width: 90%; max-width: 450px; }
+        .plate { height: 70px; width: 18px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: bold; color: black; }
+        .p-25 { background: #ef4444; height: 85px; } .p-20 { background: #3b82f6; height: 80px; } .p-15 { background: #eab308; height: 75px; } .p-10 { background: #22c55e; height: 65px; } .p-5 { background: #f8fafc; height: 55px; } .p-2-5 { background: #000; color: white; height: 45px; }
+    /* smaller fractional plates for IPF (1.25, 0.5) */
+    .p-1-25 { background: #cbd5e1; height: 38px; font-size:9px; }
+    .p-0-5 { background: #94a3b8; height: 30px; font-size:9px; color:white }
+    /* clip visuals (collars) - small decorative (not used for plate rendering) */
+    .clip { width: 12px; height: 28px; background: #bdbdbd; border-radius: 2px; display: inline-block; margin: 0 6px; box-shadow: inset 0 0 0 2px rgba(0,0,0,0.08); }
+    /* clip-plate: visually a 2.5kg plate but styled differently and always placed outermost */
+    .clip-plate { background: #6b7280; color: white; height: 45px; font-size: 10px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-weight: 800; margin-left: 6px; box-shadow: 0 1px 0 rgba(0,0,0,0.4); }
+        .bar-shaft { width: 12px; height: 95px; background: #94a3b8; border-radius: 2px; }
+
+        .loader { border: 4px solid rgba(255,255,255,0.1); border-top: 4px solid var(--primary); border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 1rem auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+<style>
+    /* Fullscreen settings view for mobile */
+    #settingsView { position: fixed; top: 0; left: 0; right: 0; bottom: 0; width: 100%; height: 100vh; background: var(--bg); display: none; z-index: 3000; padding: 1rem; box-sizing: border-box; overflow:auto; }
+    #settingsView .card { max-width: 900px; margin: 0 auto; }
+    /* When sidebar is moved into the settings view it must be visible (override default .sidebar-wrapper rule) */
+    #settingsView .sidebar-wrapper { display: block !important; position: static !important; width: 100%; }
+    #settingsView .sidebar-wrapper .card { margin-bottom: 1rem; }
+    /* Generic fullscreen overlay class for graphs/history/settings */
+    .overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; width: 100%; height: 100vh; background: var(--bg); z-index: 3000; padding: 1rem; box-sizing: border-box; overflow:auto; }
+    .modal-overlay.fullscreen { background: var(--bg); align-items: flex-start; justify-content: center; padding-top: 1rem; }
+    .modal-overlay.fullscreen .modal-content { width: 100%; max-width: 100%; height: 100vh; max-height: 100vh; border-radius: 12px; padding: 1rem; box-sizing: border-box; overflow:auto; box-shadow: 0 8px 30px rgba(2,6,23,0.06); border: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<div class="navbar">
+    <h1>RPE CALC</h1>
+    <div class="top-nav-buttons">
+    <button style="background:var(--card-bg); color:white; border:1px solid var(--border); padding:0.5rem 1rem; border-radius:6px; cursor:pointer;" onclick="toggleGraphView()">Graphs</button>
+        <button style="background:var(--card-bg); color:white; border:1px solid var(--border); padding:0.5rem 1rem; border-radius:6px; cursor:pointer;" onclick="showHistory()">History</button>
+    <button id="expandToggleBtn" style="background:var(--card-bg); color:white; border:1px solid var(--border); padding:0.5rem 1rem; border-radius:6px; cursor:pointer;" onclick="toggleExpandToggle()">Expand All</button>
+    <button id="settingsBtn" style="background:var(--card-bg); color:white; border:1px solid var(--border); padding:0.5rem 1rem; border-radius:6px; cursor:pointer;" onclick="toggleSettings()">Settings</button>
+    </div>
+</div>
+
+<div class="week-nav" id="navWeeks"></div>
+
+<div class="main-grid">
+    <div class="sidebar-wrapper">
+    <div class="card">
+            <h2>Your Maxes</h2>
+            <div id="statsInputs"></div>
+        </div>
+        <!-- Rounding moved into Preferences below -->
+            <div class="card">
+                <h2>Preferences</h2>
+                <div style="display:flex; flex-direction:column; gap:8px;">
+                    <!-- Units removed: app uses kg internally and displays numeric weights without unit suffix -->
+
+                    <div style="font-size:0.9rem; color:var(--text-muted)">
+                                <div style="margin-bottom:6px; font-weight:600">Rounding step</div>
+                                <select id="roundStep" class="pref-select" onchange="setRoundingStep(this.value)">
+                                    <option value="none">No rounding</option>
+                                    <option value="0.5">0.5</option>
+                                    <option value="2.5">2.5</option>
+                                    <option value="5">5</option>
+                                </select>
+                    </div>
+
+                    <div style="font-size:0.9rem; color:var(--text-muted)">
+                        <div style="margin-bottom:6px; font-weight:600">Theme</div>
+                        <select id="themeSelect" class="pref-select" onchange="setTheme(this.value)">
+                            <option value="default">Default</option>
+                            <option value="light">Light</option>
+                            <option value="solar">Solar</option>
+                            <option value="dusk">Dusk</option>
+                            <option value="forest">Forest</option>
+                            <option value="neon">Neon</option>
+                        </select>
+                    </div>
+                    <div style="font-size:0.9rem; color:var(--text-muted)">
+                        <div style="margin-bottom:6px; font-weight:600">Rounding mode</div>
+                        <select id="roundingMode" class="pref-select" onchange="setRoundingMode(this.value)">
+                            <option value="nearest">Nearest (step)</option>
+                            <option value="up">Force Round Up</option>
+                            <option value="down">Force Round Down</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        <div class="card">
+            <h2>Timer & Sound</h2>
+            <div style="display:flex; flex-direction:column; gap:12px;">
+                <div>
+                    <div style="margin-bottom:6px; font-weight:600; font-size:0.9rem; color:var(--text-muted)">Sound Profile</div>
+                    <select id="timerSoundProfile" class="pref-select" onchange="setTimerSoundProfile(this.value)">
+                        <option value="classic">Classic Ping</option>
+                        <option value="digital">Digital Beep</option>
+                        <option value="mellow">Mellow Chime</option>
+                        <option value="neon">Neon Pulse</option>
+                    </select>
+                </div>
+                <div>
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; font-size:0.9rem; color:var(--text-muted)">
+                        <span style="font-weight:600">Volume</span>
+                        <span id="timerVolumeLabel">70%</span>
+                    </div>
+                    <input id="timerVolume" type="range" min="0" max="100" value="70" oninput="setTimerVolume(this.value)" style="width:100%;">
+                </div>
+                <div style="display:flex; flex-wrap:wrap; gap:8px;">
+                    <button id="timerMuteBtn" style="flex:1; min-width:140px; padding:0.55rem; background:var(--card-bg); border:1px solid var(--border); color:var(--text); border-radius:6px; cursor:pointer;" onclick="toggleTimerMute()">Mute Timer</button>
+                    <button style="flex:1; min-width:140px; padding:0.55rem; background:var(--primary); border:1px solid var(--primary); color:white; border-radius:6px; cursor:pointer;" onclick="playTimerSound(false)">Test Sound</button>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <h2>Google Sheet</h2>
+            <p style="margin-top:-0.5rem; font-size:0.85rem; color:var(--text-muted)">Paste the share link or Sheet ID from Google Sheets. Changes are saved locally.</p>
+            <input id="sheetLinkInput" type="text" class="pref-input" placeholder="https://docs.google.com/..." autocomplete="off" spellcheck="false">
+            <div style="display:flex; gap:8px; margin-top:10px;">
+                <button style="flex:2; padding:0.55rem; background:var(--highlight); color:white; border:none; border-radius:6px; font-weight:600; cursor:pointer;" onclick="saveSheetLink()">Save Link</button>
+                <button style="flex:1; padding:0.55rem; background:transparent; border:1px solid var(--border); color:var(--text); border-radius:6px; cursor:pointer;" onclick="resetSheetLink()">Reset</button>
+            </div>
+            <div id="sheetLinkStatus" style="margin-top:8px; font-size:0.8rem; color:var(--text-muted)"></div>
+        </div>
+        <button onclick="resetChecks()" style="width:100%; padding:0.8rem; background:transparent; border:1px solid var(--danger); color:var(--danger); border-radius:8px; cursor:pointer; font-weight:600;">Reset Week Checks</button>
+    </div>
+
+    <div id="workoutDisplay">
+        <div class="card" style="text-align:center;">
+            <div class="loader"></div>
+            <p>Connecting to Google Sheets...</p>
+        </div>
+    </div>
+
+    <div id="graphView" style="display:none; width:100%;">
+        <div class="card" style="display:flex; justify-content:space-between; align-items:center;">
+            <div>
+                <h2>Program Analysis</h2>
+                <div style="font-size:0.75rem; color:var(--text-muted)">
+                    <span style="color:white; font-weight:bold">White Line</span> = Actual | 
+                    <span style="text-decoration:dashed; border-bottom:1px dashed white">Dashed</span> = Target | 
+                    <span style="opacity:0.5">Bar</span> = Volume
+                </div>
+            </div>
+            <div style="display:flex; gap:12px; align-items:center">
+                <div id="graphLoader" style="font-size:0.8rem; color:var(--highlight); display:none;">Loading...</div>
+                <button id="graphBackBtn" style="background:var(--card-bg); color:var(--text); border:1px solid var(--border); padding:0.4rem 0.8rem; border-radius:6px; cursor:pointer;" onclick="closeGraphView()">Back</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2 style="color:#ef4444">1. Squat Overview</h2>
+            <div class="chart-container"><canvas id="sqChart"></canvas></div>
+        </div>
+
+        <div class="card">
+            <h2 style="color:#3b82f6">2. Bench Overview</h2>
+            <div class="chart-container"><canvas id="bpChart"></canvas></div>
+        </div>
+
+        <div class="card">
+            <h2 style="color:#22c55e">3. Deadlift Overview</h2>
+            <div class="chart-container"><canvas id="dlChart"></canvas></div>
+        </div>
+
+        <div class="card">
+            <h2 style="color:#f59e42">4. Strength (Movement Quality)</h2>
+            <div class="chart-container"><canvas id="strengthChart"></canvas></div>
+        </div>
+    </div>
+
+    <!-- Mobile settings view: on small screens we temporarily move the sidebar here -->
+    <div id="settingsView" style="display:none; width:100%;">
+        <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <h2>Settings</h2>
+                <button id="settingsBackBtn" style="background:var(--card-bg); color:var(--text); border:1px solid var(--border); padding:0.4rem 0.8rem; border-radius:6px; cursor:pointer;" onclick="closeSettingsView()">Back</button>
+            </div>
+            <div id="settingsContainer" style="margin-top:12px;"></div>
+        </div>
+    </div>
+</div>
+
+<div id="plateModal" class="modal-overlay" role="dialog" aria-modal="true" aria-hidden="true" onclick="closeModal('plateModal')">
+    <div class="modal-content" onclick="event.stopPropagation()" tabindex="-1">
+    <h2 id="plateWeightTitle" style="text-align:center; font-size:2.5rem; margin-bottom:0.5rem;">0</h2>
+        <div id="plateVisuals" style="display:flex; justify-content:center; align-items:center; gap:5px;"></div>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+            <button id="clipsToggleBtn" style="flex:1; padding:0.6rem; background:var(--card-bg); border:1px solid var(--border); color:var(--text); border-radius:6px; cursor:pointer;" onclick="toggleClips()">Clips: Off</button>
+        </div>
+        <button id="plateCloseBtn" style="width:100%; margin-top:30px; padding:1rem; background:var(--primary); color:white; border:none; border-radius:8px;" onclick="closeModal('plateModal')">Close</button>
+    </div>
+</div>
+
+<div id="historyModal" class="modal-overlay" role="dialog" aria-modal="true" aria-hidden="true" onclick="closeModal('historyModal')">
+    <div class="modal-content" style="max-height:80vh; overflow-y:auto" onclick="event.stopPropagation()" tabindex="-1">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <h2 style="margin:0;">Session History</h2>
+            <button id="historyBackBtn" style="background:var(--card-bg); color:var(--text); border:1px solid var(--border); padding:0.4rem 0.8rem; border-radius:6px; cursor:pointer;" onclick="closeHistoryView()">Back</button>
+        </div>
+        <div id="historyLogs"></div>
+        <div style="display:flex; gap:8px; margin-top:10px;">
+            <button id="exportHistoryBtn" style="flex:1; padding:0.8rem; background:var(--card-bg); border:1px solid var(--border); color:var(--text);" onclick="exportHistoryCSV()">Export CSV</button>
+            <button id="importHistoryBtn" style="flex:1; padding:0.8rem; background:var(--card-bg); border:1px solid var(--border); color:var(--text);" onclick="triggerImportHistory()">Import CSV</button>
+            <button id="clearHistoryBtn" style="flex:1; padding:0.8rem; background:transparent; border:1px solid var(--danger); color:var(--danger);" onclick="localStorage.removeItem('workout_history'); showHistory()">Clear History</button>
+            <input id="importHistoryInput" type="file" accept=".csv,text/csv" style="display:none" onchange="handleHistoryFileChange(event)">
+        </div>
+            <button id="historyCloseBtn" style="width:100%; margin-top:10px; padding:0.8rem;" onclick="closeHistoryView()">Close</button>
+    </div>
+</div>
+
+<script>
+    // ==========================================
+    // 👇 CONFIGURE YOUR SHEET HERE 👇
+    // ==========================================
+    const DEFAULT_SHEET_ID = "";
+    const SHEET_ID_STORAGE_KEY = 'custom_sheet_id';
+    const SHEET_URL_STORAGE_KEY = 'custom_sheet_url';
+    const THEME_CLASSES = ['theme-light','theme-solar','theme-dusk','theme-forest','theme-neon'];
+    const TIMER_SOUND_PROFILE_KEY = 'timer_sound_profile';
+    const TIMER_VOLUME_KEY = 'timer_volume';
+    const TIMER_MUTE_KEY = 'timer_mute';
+    const DEFAULT_TIMER_PROFILE = 'classic';
+    const DEFAULT_TIMER_VOLUME = 70;
+    const SOUND_PROFILES = {
+        classic: { type: 'triangle', normal: [880], alarm: [880, 660, 880] },
+        digital: { type: 'square', normal: [1050], alarm: [1200, 950, 1200] },
+        mellow: { type: 'sine', normal: [620], alarm: [620, 520, 620] },
+        neon: { type: 'sawtooth', normal: [900], alarm: [900, 700, 900] }
+    };
+    let SHEET_ID = getStoredSheetId();
+    const API_KEY = "AIzaSyAbSb2Ywku4lL_Tj65F1wCTiT4cWfxMV6M"; 
+    // ==========================================
+
+    const RPE_CHART = {
+        1: {10:1, 9.5:0.978, 9:0.955, 8.5:0.939, 8:0.922, 7.5:0.907, 7:0.892, 6.5:0.878, 6:0.864},
+        2: {10:0.955, 9.5:0.939, 9:0.922, 8.5:0.907, 8:0.892, 7.5:0.878, 7:0.864, 6.5:0.85, 6:0.837},
+        3: {10:0.922, 9.5:0.907, 9:0.892, 8.5:0.878, 8:0.864, 7.5:0.85, 7:0.837, 6.5:0.824, 6:0.811},
+        4: {10:0.892, 9.5:0.878, 9:0.864, 8.5:0.85, 8:0.837, 7.5:0.824, 7:0.811, 6.5:0.799, 6:0.788},
+        5: {10:0.864, 9.5:0.85, 9:0.837, 8.5:0.824, 8:0.811, 7.5:0.799, 7:0.788, 6.5:0.776, 6:0.766},
+        6: {10:0.837, 9.5:0.824, 9:0.811, 8.5:0.799, 7.5:0.776, 7:0.766, 6.5:0.755, 6:0.744}
+    };
+    const STRENGTH_STEPS = [
+        { value: '2', label: '+2 Hard' },
+        { value: '1.5', label: '+1.5 Push' },
+        { value: '1', label: '+1 Strain' },
+        { value: '0.5', label: '+0.5 Challenging' },
+        { value: '0', label: '0 Neutral' },
+        { value: '-0.5', label: '-0.5 Smooth' },
+        { value: '-1', label: '-1 Easy' },
+        { value: '-1.5', label: '-1.5 Very Easy' },
+        { value: '-2', label: '-2 Effortless' }
+    ];
+    const STRENGTH_LABELS = STRENGTH_STEPS.reduce((map, step) => {
+        map[step.value] = step.label;
+        return map;
+    }, {});
+
+    function renderStrengthOptions(selectedValue = '0') {
+        const target = String(selectedValue);
+        return STRENGTH_STEPS.map(step => `<option value="${step.value}"${step.value === target ? ' selected' : ''}>${step.label}</option>`).join('');
+    }
+
+    function getStrengthText(val) {
+        return STRENGTH_LABELS[String(val)] || `${val}`;
+    }
+
+    let activeTab = "";
+    let allTabNames = [];
+    let fullProgramCache = null;
+    let charts = {};
+    const timerStates = {};
+    let timerAudioCtx = null;
+
+    // GLOBAL CHART DEFAULTS
+    Chart.defaults.interaction.mode = 'index';
+    Chart.defaults.interaction.intersect = false;
+    Chart.defaults.plugins.tooltip.enabled = true;
+
+    window.onload = () => {
+        initSidebar();
+        initSheetLinkControls();
+        fetchTabsAndInit();
+        // restore sidebar preference (hidden by default)
+        const open = localStorage.getItem('sidebar_open') === 'true';
+        if (open) document.querySelector('.main-grid').classList.add('sidebar-open');
+    };
+
+    // Toggle settings sidebar visibility, persist preference
+    function toggleSettings() {
+        const mg = document.querySelector('.main-grid');
+        if (!mg) return;
+        const sv = document.getElementById('settingsView');
+        const sc = document.getElementById('settingsContainer');
+        const sidebar = document.querySelector('.sidebar-wrapper');
+        if (!sv || !sc || !sidebar) {
+            // fallback to previous behavior
+            const open = mg.classList.toggle('sidebar-open');
+            localStorage.setItem('sidebar_open', open ? 'true' : 'false');
+            return;
+        }
+
+        if (sv.style.display === 'block') {
+            closeSettingsView();
+            return;
+        }
+
+        // move sidebar into the settings container
+        sc.appendChild(sidebar);
+
+        // remember which main view was visible so we can restore it
+        const wd = document.getElementById('workoutDisplay');
+        const gv = document.getElementById('graphView');
+        const nav = document.querySelector('.navbar');
+        const weeks = document.getElementById('navWeeks');
+        window._prevView = (gv && gv.style.display !== 'none') ? 'graph' : 'workout';
+
+        // hide main workout/graph areas and top chrome
+        if (wd) wd.style.display = 'none';
+        if (gv) gv.style.display = 'none';
+        if (nav) nav.style.display = 'none';
+        if (weeks) weeks.style.display = 'none';
+
+        // prevent body scroll behind the settings overlay
+        document.body.style.overflow = 'hidden';
+        sv.style.display = 'block';
+    }
+
+    function closeSettingsView() {
+        const sv = document.getElementById('settingsView');
+        const sidebar = document.querySelector('.sidebar-wrapper');
+        const mg = document.querySelector('.main-grid');
+        const workout = document.getElementById('workoutDisplay');
+        if (!sv || !sidebar || !mg || !workout) return;
+        // move sidebar back to the start of the main grid
+        mg.insertBefore(sidebar, workout);
+        sv.style.display = 'none';
+
+        // restore previously visible view (graph or workout)
+        const gv = document.getElementById('graphView');
+        if (window._prevView === 'graph' && gv) {
+            gv.style.display = 'block';
+            if (workout) workout.style.display = 'none';
+        } else {
+            if (workout) workout.style.display = 'block';
+            if (gv) gv.style.display = 'none';
+        }
+
+        // restore top chrome
+        const nav = document.querySelector('.navbar');
+        const weeks = document.getElementById('navWeeks');
+        if (nav) nav.style.display = '';
+        if (weeks) weeks.style.display = '';
+        document.body.style.overflow = '';
+    }
+
+    function initSidebar() {
+        const cont = document.getElementById('statsInputs');
+        ['Squat', 'Bench Press', 'Deadlift'].forEach(l => {
+                const val = localStorage.getItem('1rm_' + l) || 100;
+                cont.innerHTML += `<div style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; gap:8px"><div style="display:flex; flex-direction:column;">
+                    <label style="font-size:0.7rem; color:var(--text-muted); margin-bottom:6px">${l}</label>
+                    <div style="font-size:0.75rem; color:var(--text-muted)">1RM</div>
+                </div>
+                <input type="number" class="actual-input max-input" step="0.5" value="${val}" oninput="localStorage.setItem('1rm_${l}', this.value); recalculateAll(); clearGraphCache();"></div>`;
+            });
+    // initialize preferences UI state
+    const roundStep = localStorage.getItem('round_step') || '2.5';
+        const theme = localStorage.getItem('theme') || 'default';
+        const roundMode = localStorage.getItem('round_mode') || 'nearest';
+        // default clips preference (persisted so modal toggle remembers state)
+        if (localStorage.getItem('plates_clips') === null) localStorage.setItem('plates_clips', 'false');
+        setTimeout(() => {
+            const rs = document.getElementById('roundStep');
+            if (rs) rs.value = roundStep;
+            const ts = document.getElementById('themeSelect');
+            if (ts) ts.value = theme;
+            const rm = document.getElementById('roundingMode');
+            if (rm) rm.value = roundMode;
+            applyTheme(theme);
+            initTimerSoundControls();
+        }, 30);
+    }
+
+    function clearGraphCache() { fullProgramCache = null; }
+
+    // ------------------ Preferences helpers ------------------
+    function setRoundingStep(v) { localStorage.setItem('round_step', v); recalculateAll(); }
+    function setRoundingMode(v) { localStorage.setItem('round_mode', v); recalculateAll(); }
+    function setTheme(v) { localStorage.setItem('theme', v); applyTheme(v); }
+    function applyTheme(name) {
+        document.body.classList.remove(...THEME_CLASSES);
+        if (name === 'light') document.body.classList.add('theme-light');
+        else if (name === 'solar') document.body.classList.add('theme-solar');
+        else if (name === 'dusk') document.body.classList.add('theme-dusk');
+        else if (name === 'forest') document.body.classList.add('theme-forest');
+        else if (name === 'neon') document.body.classList.add('theme-neon');
+    }
+
+    function getStoredSheetId() {
+        try {
+            return localStorage.getItem(SHEET_ID_STORAGE_KEY) || DEFAULT_SHEET_ID;
+        } catch (err) {
+            console.warn('Unable to read stored sheet id', err);
+            return DEFAULT_SHEET_ID;
+        }
+    }
+
+    function getStoredSheetLink() {
+        try {
+            return localStorage.getItem(SHEET_URL_STORAGE_KEY) || '';
+        } catch (err) {
+            console.warn('Unable to read stored sheet link', err);
+            return '';
+        }
+    }
+
+    function extractSheetId(value) {
+        if (!value) return '';
+        const trimmed = String(value).trim();
+        const linkMatch = trimmed.match(/\/d\/([a-zA-Z0-9_-]+)/);
+        if (linkMatch && linkMatch[1]) return linkMatch[1];
+        if (/^[a-zA-Z0-9_-]{15,}$/.test(trimmed)) return trimmed;
+        return '';
+    }
+
+    function getTimerSoundProfile() {
+        return localStorage.getItem(TIMER_SOUND_PROFILE_KEY) || DEFAULT_TIMER_PROFILE;
+    }
+
+    function getTimerVolume() {
+        const stored = parseInt(localStorage.getItem(TIMER_VOLUME_KEY), 10);
+        if (isNaN(stored)) return DEFAULT_TIMER_VOLUME;
+        return Math.min(100, Math.max(0, stored));
+    }
+
+    function isTimerMuted() {
+        return localStorage.getItem(TIMER_MUTE_KEY) === 'true';
+    }
+
+    function initTimerSoundControls() {
+        const profileEl = document.getElementById('timerSoundProfile');
+        if (profileEl) profileEl.value = getTimerSoundProfile();
+        const volumeEl = document.getElementById('timerVolume');
+        if (volumeEl) volumeEl.value = getTimerVolume();
+        updateTimerVolumeLabel();
+        updateTimerMuteButton();
+    }
+
+    function setTimerSoundProfile(val) {
+        localStorage.setItem(TIMER_SOUND_PROFILE_KEY, val || DEFAULT_TIMER_PROFILE);
+        if (document.getElementById('timerSoundProfile')) {
+            document.getElementById('timerSoundProfile').value = val;
+        }
+    }
+
+    function setTimerVolume(val) {
+        const volume = Math.min(100, Math.max(0, parseInt(val, 10) || 0));
+        localStorage.setItem(TIMER_VOLUME_KEY, String(volume));
+        const slider = document.getElementById('timerVolume');
+        if (slider && slider.value !== String(volume)) slider.value = volume;
+        updateTimerVolumeLabel();
+        updateActiveAlarmVolumes();
+    }
+
+    function updateTimerVolumeLabel() {
+        const label = document.getElementById('timerVolumeLabel');
+        if (label) label.innerText = `${getTimerVolume()}%`;
+    }
+
+    function toggleTimerMute() {
+        const muted = !isTimerMuted();
+        localStorage.setItem(TIMER_MUTE_KEY, muted ? 'true' : 'false');
+        if (muted) {
+            Object.keys(timerStates).forEach(key => stopAlarm(key));
+        }
+        updateTimerMuteButton();
+    }
+
+    function updateTimerMuteButton() {
+        const btn = document.getElementById('timerMuteBtn');
+        if (!btn) return;
+        const muted = isTimerMuted();
+        btn.innerText = muted ? 'Unmute Timer' : 'Mute Timer';
+        btn.style.opacity = muted ? '0.7' : '1';
+    }
+
+    function getAlarmBaseVolume() {
+        return Math.max(0.08, Math.min(1, (getTimerVolume() / 100) * 0.75));
+    }
+
+    function updateActiveAlarmVolumes() {
+        const base = getAlarmBaseVolume();
+        if (!timerAudioCtx) return;
+        Object.values(timerStates).forEach(state => {
+            if (!state || !state.alarmGain) return;
+            state.alarmBaseVolume = base;
+            const now = timerAudioCtx.currentTime;
+            try {
+                state.alarmGain.gain.cancelScheduledValues(now);
+                state.alarmGain.gain.setValueAtTime(base, now);
+            } catch (err) {
+                state.alarmGain.gain.value = base;
+            }
+        });
+    }
+
+    function initSheetLinkControls() {
+        const input = document.getElementById('sheetLinkInput');
+        if (input) input.value = getStoredSheetLink();
+        updateSheetLinkStatus();
+    }
+
+    function renderSheetSetupCard() {
+        const container = document.getElementById('workoutDisplay');
+        if (!container) return;
+        const existing = getStoredSheetLink();
+        const value = existing ? existing.replace(/&/g, '&amp;').replace(/"/g, '&quot;') : '';
+        container.innerHTML = `
+            <div class="card" style="display:flex; flex-direction:column; gap:12px;">
+                <div>
+                    <h2 style="margin:0 0 4px 0;">Connect Your Google Sheet</h2>
+                    <p style="margin:0; font-size:0.9rem; color:var(--text-muted)">Paste the Sheet link or ID so your workouts can load.</p>
+                </div>
+                <input id="inlineSheetLinkInput" type="text" class="pref-input" placeholder="https://docs.google.com/..." autocomplete="off" spellcheck="false" value="${value}">
+                <button style="padding:0.75rem; background:var(--highlight); color:white; border:none; border-radius:8px; font-weight:600; cursor:pointer;" onclick="saveSheetLink('inlineSheetLinkInput')">Save & Load</button>
+                <p style="margin:0; font-size:0.8rem; color:var(--text-muted)">You can update this later inside Settings → Google Sheet.</p>
+            </div>`;
+    }
+
+    function updateSheetLinkStatus() {
+        const el = document.getElementById('sheetLinkStatus');
+        if (!el) return;
+        const link = getStoredSheetLink();
+        const shortId = SHEET_ID ? `${SHEET_ID.slice(0,6)}...` : 'none';
+        if (!link && !SHEET_ID) {
+            el.innerText = 'No sheet linked yet. Paste a Google Sheets link to begin.';
+        } else if (link) {
+            el.innerText = `Custom sheet active (${shortId}).`;
+        } else {
+            el.innerText = `Using default sheet (${shortId}).`;
+        }
+    }
+
+    function saveSheetLink(fieldId) {
+        const input = document.getElementById(fieldId || 'sheetLinkInput');
+        if (!input) return;
+        const raw = input.value.trim();
+        if (!raw) {
+            alert('Paste your Google Sheets link or ID, or click Reset to use the default.');
+            return;
+        }
+        const id = extractSheetId(raw);
+        if (!id) {
+            alert('Could not find a Sheet ID in that value. Make sure you pasted the full Google Sheets URL.');
+            return;
+        }
+        try {
+            localStorage.setItem(SHEET_ID_STORAGE_KEY, id);
+            localStorage.setItem(SHEET_URL_STORAGE_KEY, raw);
+        } catch (err) {
+            console.warn('Unable to save sheet link', err);
+        }
+        SHEET_ID = id;
+        updateSheetLinkStatus();
+        clearGraphCache();
+        fetchTabsAndInit();
+    }
+
+    function resetSheetLink() {
+        try {
+            localStorage.removeItem(SHEET_ID_STORAGE_KEY);
+            localStorage.removeItem(SHEET_URL_STORAGE_KEY);
+        } catch (err) {
+            console.warn('Unable to reset sheet link', err);
+        }
+        SHEET_ID = DEFAULT_SHEET_ID;
+        const input = document.getElementById('sheetLinkInput');
+        if (input) input.value = '';
+        updateSheetLinkStatus();
+        clearGraphCache();
+        fetchTabsAndInit();
+    }
+
+    function formatWeight(kg) {
+        if (kg === null || kg === undefined || isNaN(kg)) return '';
+        // return numeric display only (no unit suffix)
+        // Show extra precision when needed (e.g. .75 instead of .8).
+        // Determine desired decimals from the configured rounding step and the value itself.
+        const rawStep = localStorage.getItem('round_step') || '0.5';
+        // count decimals in step (e.g. 1.25 -> 2 decimals)
+        let stepDecimals = 0;
+        if (rawStep === 'none') {
+            stepDecimals = 3; // allow finer display when no rounding selected
+        } else {
+            try {
+                const s = String(rawStep);
+                if (s.indexOf('.') >= 0) stepDecimals = s.split('.')[1].length;
+            } catch (e) { stepDecimals = 0; }
+        }
+
+        // check whether 2-decimal precision materially differs from 1-decimal precision
+        const rounded1 = Math.round(kg * 10) / 10;
+        const rounded2 = Math.round(kg * 100) / 100;
+
+        let decimals = 0;
+        if (Math.abs(kg - Math.round(kg)) < 1e-9) decimals = 0; // integer
+        else if (Math.abs(rounded2 - rounded1) > 1e-9) decimals = Math.max(2, stepDecimals);
+        else decimals = Math.max(1, stepDecimals);
+
+        // cap to sensible max (avoid weird floating artifacts)
+        decimals = Math.min(decimals, 3);
+
+        let out = kg.toFixed(decimals);
+        // trim unnecessary trailing zeros and optional trailing dot
+        out = out.replace(/(?:\.0+|(?<=\.\d+)0+)$/, '').replace(/\.$/, '');
+        return out;
+    }
+
+    async function fetchTabsAndInit() {
+        if (!API_KEY || API_KEY.includes("PASTE")) {
+            document.getElementById('workoutDisplay').innerHTML = '<div class="card" style="color:var(--danger)">Error: You need to add a Google API Key.</div>';
+            return;
+        }
+
+        if (!SHEET_ID) {
+            const nav = document.getElementById('navWeeks');
+            if (nav) nav.innerHTML = '';
+            renderSheetSetupCard();
+            return;
+        }
+
+        try {
+            const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?key=${API_KEY}`);
+            const data = await response.json();
+            if (data.error) throw new Error(data.error.message);
+
+            const tabs = data.sheets.map(s => s.properties.title);
+            allTabNames = tabs; 
+            
+            const nav = document.getElementById('navWeeks');
+            nav.innerHTML = "";
+            tabs.forEach(name => {
+                const btn = document.createElement('button'); 
+                btn.className = 'week-btn'; 
+                btn.innerText = name;
+                btn.onclick = () => loadTab(name); 
+                nav.appendChild(btn);
+            });
+
+            if(tabs.length > 0) loadTab(tabs[0]);
+        } catch (e) {
+            document.getElementById('workoutDisplay').innerHTML = `<div class="card" style="color:var(--danger)">API Error: ${e.message}</div>`;
+        }
+    }
+
+    // --- STANDARD WORKOUT LOADING ---
+    function loadTab(tabName) {
+        activeTab = tabName;
+        document.getElementById('workoutDisplay').style.display = 'block';
+        document.getElementById('graphView').style.display = 'none';
+        
+        document.querySelectorAll('.week-btn').forEach(b => b.classList.toggle('active', b.innerText === tabName));
+        document.getElementById('workoutDisplay').innerHTML = '<div class="card" style="text-align:center"><div class="loader"></div><p>Fetching ' + tabName + '...</p></div>';
+        
+        const old = document.getElementById('sheetScript');
+        if (old) old.remove();
+
+        const timestamp = Date.now();
+        const callbackName = 'cb_' + timestamp;
+
+        window[callbackName] = (json) => {
+            processSheet(json.table.rows);
+            delete window[callbackName];
+        };
+
+        const script = document.createElement('script');
+        script.id = 'sheetScript';
+        script.src = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=responseHandler:${callbackName}&sheet=${encodeURIComponent(tabName)}&headers=0&t=${timestamp}`;
+        document.body.appendChild(script);
+    }
+
+    function processSheet(rows) {
+        const display = document.getElementById('workoutDisplay');
+        display.innerHTML = '';
+        Object.keys(timerStates).forEach(key => {
+            const state = timerStates[key];
+            if (!state) return;
+            if (state.interval) clearInterval(state.interval);
+            stopAlarm(key);
+            delete timerStates[key];
+        });
+        let currentSection = null; let tbody = null;
+
+        rows.forEach((r, idx) => {
+            const v = (i) => (r.c && r.c[i] && r.c[i].v !== null) ? String(r.c[i].v).trim() : "";
+            const name = v(0), setsStr = v(1), repsRaw = v(2), rpeStr = v(3), note = v(4);
+            const setsNum = parseInt(setsStr);
+            const repsNum = parseInt(repsRaw);
+            const noteLower = note.toLowerCase();
+            const noteDropMatch = noteLower.match(/-\s*(\d+(?:\.\d+)?)/);
+            const isTimeRow = noteLower.includes('timed') || noteLower.includes('sec') || rpeStr.toUpperCase() === 'SEC';
+
+            if (name.toLowerCase() === 'exercise') return;
+
+            if (name && (setsStr === "" || isNaN(setsNum))) {
+                if (currentSection) display.appendChild(currentSection);
+                currentSection = document.createElement('div');
+                currentSection.className = 'workout-section collapsed';
+                currentSection.innerHTML = `
+                    <div class="day-header">
+                        <div class="header-top">
+                            <div class="header-content" onclick="toggleSection(this)">
+                                <span class="arrow">▼</span>
+                                <span>${name}</span>
+                            </div>
+                            <span class="check-all-btn" role="button" tabindex="0" onclick="toggleAllChecks(this)">Check All</span>
+                        </div>
+                        <div class="progress-wrapper">
+                            <div class="progress-container"><div class="progress-bar"></div></div>
+                            <span class="progress-label">0%</span>
+                        </div>
+                    </div>
+                    <div class="content">
+                        <table><thead><tr><th style="width:30px"></th><th>Exercise</th><th>Target</th><th>Act.</th></tr></thead><tbody></tbody></table>
+                        <button class="btn-finish" onclick="finishWorkout('${name}', this)">Finish Workout</button>
+                    </div>`;
+                tbody = currentSection.querySelector('tbody');
+                return;
+            }
+
+            if (!tbody) return;
+
+            const isRamp = note.toLowerCase().includes('ramp') || note.toLowerCase().includes('warmup');
+            const id = `${activeTab}_${idx}`;
+
+            if (isTimeRow) {
+                tbody.appendChild(createTimeRow(name, setsStr, repsRaw, note, id));
+                return;
+            }
+
+            if (isRamp && setsNum > 1) {
+                for (let i = 1; i <= setsNum; i++) {
+                    const label = (i === setsNum) ? "Top Set" : `Ramp ${i}`;
+                    const dec = (setsNum - i) * 5;
+                    const css = (i === 1) ? "ramp-row" : (i === setsNum) ? "ramp-last-row" : "ramp-row";
+                    tbody.appendChild(createRow(name, 1, repsNum, parseFloat(rpeStr), label, `${id}_r${i}`, dec, css));
+                }
+            } else if (rpeStr.includes('%') || rpeStr.startsWith('-')) {
+                // parse numeric portion, normalize fractional values (0.075 -> 7.5), round for display
+                let drop = Math.abs(parseFloat(rpeStr.replace(/[^0-9.-]/g, ''))) || 10;
+                if (drop > 0 && drop <= 1) drop = drop * 100; // handle fractional percent values
+                drop = Math.round(drop * 10) / 10; // one decimal precision
+                tbody.appendChild(createBackoffRow(name, setsStr, repsNum, drop, id));
+            } else if (noteDropMatch) {
+                const dropKg = parseFloat(noteDropMatch[1]);
+                if (!isNaN(dropKg) && dropKg > 0) {
+                    tbody.appendChild(createBackoffRow(name, setsStr, repsNum, dropKg, id, { absolute: true }));
+                } else {
+                    tbody.appendChild(createRow(name, setsStr, repsNum, parseFloat(rpeStr), note, id));
+                }
+            } else {
+                tbody.appendChild(createRow(name, setsStr, repsNum, parseFloat(rpeStr), note, id));
+            }
+        });
+    if (currentSection) display.appendChild(currentSection);
+    recalculateAll();
+    document.querySelectorAll('.workout-section').forEach(sec => updateSectionProgress(sec));
+    // wire inputs and keyboard handlers once rows are present
+    setTimeout(() => { attachInputHandlers(); }, 50);
+    }
+
+    function createRow(name, sets, reps, rpe, note, id, dec = 0, css = "") {
+        const tr = document.createElement('tr'); tr.className = `main-row ${css}`;
+        const checks = JSON.parse(localStorage.getItem('checks') || '{}');
+        if (checks[id]) tr.classList.add('completed');
+        const pct = (RPE_CHART[reps] && RPE_CHART[reps][rpe]) ? RPE_CHART[reps][rpe] : 0;
+        const noteText = (typeof note === 'string') ? note : '';
+        const repeatAttr = noteText.toLowerCase().includes('repeat') ? ' data-repeat="true"' : '';
+        tr.innerHTML = `
+            <td class="cell-done" data-label="Done"><div class="check-circle ${checks[id]?'checked':''}" data-id="${id}" tabindex="0" onclick="toggleCheck(this)" onkeydown="if(event.key===' '||event.key==='Enter'){ event.preventDefault(); toggleCheck(this);}"></div></td>
+            <td class="cell-exercise" data-label="Exercise"><div style="font-weight:bold">${name}</div><div style="font-size:0.75rem; color:var(--text-muted)">${noteText}</div></td>
+            <td class="cell-target target-cell" data-label="Target"><div class="target-label">${sets}x${reps} @${rpe || 'N/A'}</div><div class="load-cell" data-ex="${name}" data-pct="${pct}" data-dec="${dec}"${repeatAttr} onclick="showPlates(this.innerText)">-</div></td>
+            <td class="cell-actual" data-label="Actual" style="display:flex; flex-direction:column; gap:6px;">
+                <input type="number" class="actual-input" data-id="${id}" placeholder="">
+                <div class="strength-field">
+                    <select class="strength-input" data-id="${id}" style="background:var(--input-bg); color:white; border:1px solid var(--border); border-radius:4px; padding:0.3rem;">
+                        ${renderStrengthOptions('0')}
+                    </select>
+                    <input type="range" min="-2" max="2" step="0.5" value="0" class="strength-slider" data-id="${id}">
+                    <div class="strength-slider-label" data-slider-label="${id}">${getStrengthText(0)}</div>
+                </div>
+            </td>
+        `;
+        return tr;
+    }
+
+    function createTimeRow(name, sets, timeValue, note, id) {
+        const tr = document.createElement('tr'); tr.className = 'time-row';
+        const checks = JSON.parse(localStorage.getItem('checks') || '{}');
+        if (checks[id]) tr.classList.add('completed');
+        const timerKey = sanitizeTimerId(id);
+        const durationSeconds = parseDurationSeconds(timeValue) || parseDurationSeconds(note) || 30;
+        ensureTimerState(timerKey, durationSeconds * 1000);
+        const timeLabel = formatTimerLabel(durationSeconds);
+        const initialClock = formatTimerClock(durationSeconds);
+        tr.innerHTML = `
+            <td class="cell-done" data-label="Done"><div class="check-circle ${checks[id]?'checked':''}" data-id="${id}" tabindex="0" onclick="toggleCheck(this)" onkeydown="if(event.key===' '||event.key==='Enter'){ event.preventDefault(); toggleCheck(this);}"></div></td>
+            <td class="cell-exercise" data-label="Exercise"><div style="font-weight:bold">${name}</div><div style="font-size:0.75rem; color:var(--text-muted)">${note || 'Timed Set'}</div></td>
+            <td class="cell-target target-cell" data-label="Target">
+                <div class="target-label" style="font-size:0.8rem">${sets || '?'}x${timeLabel} (Time)</div>
+                <div class="timer-controls" data-timer-wrapper="${timerKey}" data-duration="${durationSeconds}">
+                    <span class="timer-display" data-timer-display="${timerKey}">${initialClock}</span>
+                    <div class="timer-btns">
+                        <button type="button" class="timer-btn primary" data-timer-start="${timerKey}" onclick="startTimer('${timerKey}')">Start</button>
+                        <button type="button" class="timer-btn secondary" data-timer-reset="${timerKey}" onclick="resetTimer('${timerKey}')">Reset</button>
+                    </div>
+                </div>
+            </td>
+            <td class="cell-actual" data-label="Actual" style="display:flex; flex-direction:column; gap:6px;">
+                <input type="number" class="actual-input" data-id="${id}" placeholder="">
+                <div class="strength-field">
+                    <select class="strength-input" data-id="${id}" style="background:var(--input-bg); color:white; border:1px solid var(--border); border-radius:4px; padding:0.3rem;">
+                        ${renderStrengthOptions('0')}
+                    </select>
+                    <input type="range" min="-2" max="2" step="0.5" value="0" class="strength-slider" data-id="${id}">
+                    <div class="strength-slider-label" data-slider-label="${id}">${getStrengthText(0)}</div>
+                </div>
+            </td>
+        `;
+        return tr;
+    }
+
+    function createBackoffRow(name, sets, reps, drop, id, options = {}) {
+        const { absolute = false } = options;
+        const tr = document.createElement('tr'); tr.className = 'backoff-row';
+        const checks = JSON.parse(localStorage.getItem('checks') || '{}');
+        if (checks[id]) tr.classList.add('completed');
+        const dropDisp = absolute ? (Math.round(drop * 100) / 100).toString().replace(/\.0+$/, '') : (Math.round(drop * 10) / 10).toString().replace(/\.0$/, '');
+        const dropSuffix = absolute ? 'kg' : '%';
+        const desc = `Backoff (-${dropDisp}${dropSuffix})`;
+        const dropAttrs = `data-drop="${drop}" data-drop-type="${absolute ? 'absolute' : 'percent'}"`;
+        tr.innerHTML = `
+            <td class="cell-done" data-label="Done"><div class="check-circle ${checks[id]?'checked':''}" data-id="${id}" tabindex="0" onclick="toggleCheck(this)" onkeydown="if(event.key===' '||event.key==='Enter'){ event.preventDefault(); toggleCheck(this);}"></div></td>
+            <td class="cell-exercise" data-label="Exercise"><div style="font-weight:bold">${name}</div><div style="font-size:0.75rem; color:var(--text-muted)">${desc}</div></td>
+            <td class="cell-target target-cell" data-label="Target"><div class="target-label" style="font-size:0.8rem">${sets}x${reps}</div><div class="load-cell backoff-calc" data-ex="${name}" ${dropAttrs} onclick="showPlates(this.innerText)">-</div></td>
+            <td class="cell-actual" data-label="Actual" style="display:flex; flex-direction:column; gap:6px;">
+                <input type="number" class="actual-input" data-id="${id}" placeholder="">
+                <div class="strength-field">
+                    <select class="strength-input" data-id="${id}" style="background:var(--input-bg); color:white; border:1px solid var(--border); border-radius:4px; padding:0.3rem;">
+                        ${renderStrengthOptions('0')}
+                    </select>
+                    <input type="range" min="-2" max="2" step="0.5" value="0" class="strength-slider" data-id="${id}">
+                    <div class="strength-slider-label" data-slider-label="${id}">${getStrengthText(0)}</div>
+                </div>
+            </td>
+        `;
+        return tr;
+    }
+
+    function findPreviousWeightRow(tr) {
+        if (!tr) return NaN;
+        let prev = tr.previousElementSibling;
+        while (prev) {
+            const val = parseFloat(prev.getAttribute('data-last-wt'));
+            if (!isNaN(val)) return val;
+            prev = prev.previousElementSibling;
+        }
+        return NaN;
+    }
+
+    function recalculateAll() {
+        const mode = document.getElementById('roundingMode').value;
+        const stepSetting = localStorage.getItem('round_step') || '2.5';
+        const roundingDisabled = stepSetting === 'none';
+        const roundStep = roundingDisabled ? null : (parseFloat(stepSetting) || 2.5);
+
+        const applyPrimaryRounding = (value) => {
+            if (roundingDisabled || !isFinite(value)) return value;
+            if (mode === 'up') return Math.ceil(value / roundStep) * roundStep;
+            if (mode === 'down') return Math.floor(value / roundStep) * roundStep;
+            return Math.round(value / roundStep) * roundStep;
+        };
+
+        document.querySelectorAll('.load-cell:not(.backoff-calc)').forEach(cell => {
+            const tr = cell.closest('tr');
+            const ex = cell.dataset.ex.toLowerCase();
+            const pct = parseFloat(cell.dataset.pct);
+            const dec = parseFloat(cell.dataset.dec);
+            const repeatPrev = cell.dataset.repeat === 'true';
+            const prevWeight = findPreviousWeightRow(tr);
+            let lift = null;
+            if (ex.includes('squat')) lift = 'Squat'; 
+            else if (ex.includes('bench')) lift = 'Bench Press'; 
+            else if (ex.includes('deadlift')) lift = 'Deadlift';
+
+            let weight = NaN;
+            if (repeatPrev && !isNaN(prevWeight)) {
+                weight = prevWeight;
+            } else if (lift && pct > 0) {
+                const max = parseFloat(localStorage.getItem('1rm_' + lift));
+                if (!isNaN(max)) weight = (max * pct) - dec;
+            }
+
+            if (!isNaN(weight)) {
+                weight = Math.max(0, applyPrimaryRounding(weight));
+                cell.innerText = formatWeight(weight);
+                tr.setAttribute('data-last-wt', weight);
+            } else {
+                cell.innerText = '-';
+                tr.removeAttribute('data-last-wt');
+            }
+        });
+        document.querySelectorAll('.backoff-calc').forEach(cell => {
+            const tr = cell.closest('tr');
+            const base = findPreviousWeightRow(tr);
+            const dropType = cell.dataset.dropType || 'percent';
+            const dropValue = parseFloat(cell.dataset.drop);
+            if (!base || isNaN(dropValue)) {
+                cell.innerText = '-';
+                tr.removeAttribute('data-last-wt');
+                return;
+            }
+            let weight = base;
+            if (dropType === 'absolute') {
+                weight = base - dropValue;
+            } else {
+                weight = base * (1 - dropValue / 100);
+            }
+            weight = Math.max(0, applyPrimaryRounding(weight));
+            cell.innerText = formatWeight(weight);
+            tr.setAttribute('data-last-wt', weight);
+        });
+    }
+
+    function toggleSection(headerContent) { headerContent.closest('.workout-section').classList.toggle('collapsed'); }
+    function updateSectionProgress(section) {
+        const total = section.querySelectorAll('.check-circle').length;
+        const checked = section.querySelectorAll('.check-circle.checked').length;
+        const percentage = total === 0 ? 0 : Math.round((checked / total) * 100);
+        const bar = section.querySelector('.progress-bar');
+        const txt = section.querySelector('.progress-label');
+        if(bar && txt) {
+            bar.style.width = percentage + "%";
+            txt.innerText = percentage + "%";
+            if (percentage <= 30) bar.style.backgroundColor = "var(--prog-low)";
+            else if (percentage <= 70) bar.style.backgroundColor = "var(--prog-mid)";
+            else bar.style.backgroundColor = "var(--prog-high)";
+        }
+    }
+    function toggleCheck(el) {
+        const id = el.dataset.id;
+        const checks = JSON.parse(localStorage.getItem('checks') || '{}');
+        const tr = el.closest('tr');
+        if (el.classList.contains('checked')) { delete checks[id]; el.classList.remove('checked'); tr.classList.remove('completed'); } 
+        else { checks[id] = true; el.classList.add('checked'); tr.classList.add('completed'); }
+        localStorage.setItem('checks', JSON.stringify(checks));
+        updateSectionProgress(tr.closest('.workout-section'));
+    }
+    function toggleAllChecks(btn) {
+        const section = btn.closest('.workout-section');
+        const circles = section.querySelectorAll('.check-circle');
+        const allChecked = Array.from(circles).every(c => c.classList.contains('checked'));
+        circles.forEach(c => { if (allChecked) { if(c.classList.contains('checked')) toggleCheck(c); } else { if(!c.classList.contains('checked')) toggleCheck(c); }});
+        updateSectionProgress(section);
+    }
+    function showPlates(txt) {
+        const wt = parseFloat(txt);
+        if (isNaN(wt)) return;
+        // treat bar as 20kg and optionally account for clips (assumed 0.5kg total when enabled)
+        const barWeight = 20;
+    const clipsOn = localStorage.getItem('plates_clips') === 'true';
+        // display numeric title without unit suffix
+        document.getElementById('plateWeightTitle').innerText = formatWeight(wt);
+        const vis = document.getElementById('plateVisuals');
+    // build visuals: bar shaft (clip rendered as clip-plate instead)
+    vis.innerHTML = '';
+    vis.innerHTML += '<div class="bar-shaft"></div>';
+
+        // compute per-side plate mass (remaining after bar and clips)
+        const clipPerSide = clipsOn ? 2.5 : 0; // each clip treated like a 2.5kg plate
+        let side = (wt - barWeight - (clipPerSide * 2)) / 2;
+        // supported IPF plates (kg) including fractional small plates
+        const plates = [{w:25,c:'p-25'},{w:20,c:'p-20'},{w:15,c:'p-15'},{w:10,c:'p-10'},{w:5,c:'p-5'},{w:2.5,c:'p-2-5'},{w:1.25,c:'p-1-25'},{w:0.5,c:'p-0-5'}];
+        // append plates (largest to smallest) while side allows
+        plates.forEach(p => { while (side + 0.0001 >= p.w) { vis.innerHTML += `<div class="plate ${p.c}">${p.w}</div>`; side -= p.w; side = Math.round(side*100)/100; }});
+
+        // if clips enabled, render a special clip-plate on the outermost/right side
+        if (clipsOn) {
+            vis.innerHTML += `<div class="plate clip-plate">2.5</div>`;
+        }
+
+        // update clips button label when modal is rendered
+        const clipBtn = document.getElementById('clipsToggleBtn');
+        if (clipBtn) clipBtn.innerText = clipsOn ? 'Clips: On' : 'Clips: Off';
+        document.getElementById('plateModal').style.display = 'flex';
+    }
+
+    function toggleClips() {
+        const cur = localStorage.getItem('plates_clips') === 'true';
+        localStorage.setItem('plates_clips', cur ? 'false' : 'true');
+        // re-render modal visuals for the currently displayed weight
+        const title = document.getElementById('plateWeightTitle');
+        const wt = parseFloat(title ? title.innerText : 0);
+        showPlates(wt);
+    }
+    function resetChecks() { if (confirm("Clear checks?")) { localStorage.removeItem('checks'); location.reload(); }}
+    function showHistory() {
+    const logs = JSON.parse(localStorage.getItem('workout_history') || '[]');
+    document.getElementById('historyLogs').innerHTML = logs.length ? logs.map(l => `<div class="card"><h4>${l.date} - ${l.day}</h4>${l.sets.map(s => `<div>${s.ex}: A:${s.actual} / T:${s.target}</div>`).join('')}</div>`).join('') : "Empty";
+        document.getElementById('historyModal').style.display = 'flex';
+    }
+    function finishWorkout(day, btn) {
+        const sets = [];
+        btn.closest('.workout-section').querySelectorAll('tr').forEach(tr => {
+            if (tr.querySelector('.check-circle.checked')) {
+                const exName = tr.cells[1].innerText.split('\n')[0];
+                const loadCell = tr.querySelector('.load-cell');
+                const timerDisplay = tr.querySelector('.timer-display');
+                const targetLabel = tr.querySelector('.target-label');
+                let targetText = targetLabel ? targetLabel.innerText : '';
+                if (loadCell) targetText = targetText ? `${targetText} | ${loadCell.innerText}` : loadCell.innerText;
+                if (timerDisplay) targetText = targetText ? `${targetText} | Timer: ${timerDisplay.innerText}` : `Timer: ${timerDisplay.innerText}`;
+                const actualInput = tr.querySelector('.actual-input');
+                let actualVal = actualInput ? actualInput.value : '';
+                if (!actualVal) {
+                    if (timerDisplay) actualVal = timerDisplay.innerText;
+                    else if (loadCell) actualVal = loadCell.innerText;
+                    else actualVal = targetText;
+                }
+                const strengthVal = (tr.querySelector('.strength-input') && tr.querySelector('.strength-input').value) || '0';
+                sets.push({ ex: exName, target: targetText, actual: actualVal || targetText, strength: strengthVal });
+            }
+        });
+        if (!sets.length) return alert("Check sets.");
+        const hist = JSON.parse(localStorage.getItem('workout_history') || '[]');
+        hist.unshift({ date: new Date().toLocaleDateString(), day, sets });
+        localStorage.setItem('workout_history', JSON.stringify(hist));
+        alert("Workout Saved!");
+    }
+
+    function updateStrengthLabel(id, value) {
+        const label = document.querySelector(`[data-slider-label="${id}"]`);
+        if (label) label.innerText = getStrengthText(value);
+    }
+
+    function syncStrengthDisplay(id, value) {
+        if (!id) return;
+        const valStr = String(value);
+        const slider = document.querySelector(`.strength-slider[data-id="${id}"]`);
+        if (slider) slider.value = valStr;
+        updateStrengthLabel(id, valStr);
+    }
+
+    function persistStrengthValue(id, value) {
+        const key = 'autosave_strength_' + activeTab;
+        const obj = JSON.parse(localStorage.getItem(key) || '{}');
+        obj[id] = value;
+        localStorage.setItem(key, JSON.stringify(obj));
+    }
+
+    function strengthSelectListener(e) {
+        const sel = e.target;
+        if (!sel || !sel.dataset.id) return;
+        const value = sel.value;
+        syncStrengthDisplay(sel.dataset.id, value);
+        persistStrengthValue(sel.dataset.id, value);
+    }
+
+    function strengthSliderListener(e) {
+        const slider = e.target;
+        if (!slider || !slider.dataset.id) return;
+        const value = String(slider.value);
+        const select = document.querySelector(`.strength-input[data-id="${slider.dataset.id}"]`);
+        if (select) select.value = value;
+        updateStrengthLabel(slider.dataset.id, value);
+        persistStrengthValue(slider.dataset.id, value);
+    }
+
+    function sanitizeTimerId(raw) {
+        return String(raw || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    }
+
+    function parseDurationSeconds(value) {
+        if (value === null || value === undefined) return 0;
+        if (typeof value === 'number' && !isNaN(value)) return Math.max(0, value);
+        const str = String(value).trim();
+        if (!str) return 0;
+        if (/^\d+:\d+$/.test(str)) {
+            const [m, s] = str.split(':').map(part => parseInt(part, 10) || 0);
+            return (m * 60) + s;
+        }
+        const num = parseFloat(str.replace(/[^0-9.]/g, ''));
+        return isNaN(num) ? 0 : Math.max(0, num);
+    }
+
+    function formatTimerClock(seconds) {
+        const total = Math.max(0, Math.round(seconds));
+        const minutes = Math.floor(total / 60);
+        const secs = total % 60;
+        return `${String(minutes).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+    }
+
+    function formatTimerLabel(seconds) {
+        const total = Math.max(0, Math.round(seconds));
+        if (!total) return 'Time';
+        if (total >= 60) {
+            const minutes = Math.floor(total / 60);
+            const secs = total % 60;
+            return secs ? `${minutes}m ${secs}s` : `${minutes}m`;
+        }
+        return `${total}s`;
+    }
+
+    function ensureTimerState(key, durationMs) {
+        const normalized = Math.max(0, Math.round(durationMs || 0));
+        if (!timerStates[key]) {
+            timerStates[key] = {
+                duration: normalized,
+                remaining: normalized,
+                running: false,
+                interval: null,
+                lastTick: null,
+                alarming: false,
+                alarmInterval: null,
+                alarmPulse: null,
+                alarmSource: null,
+                alarmGain: null,
+                alarmBaseVolume: getAlarmBaseVolume()
+            };
+        } else if (normalized && timerStates[key].duration !== normalized) {
+            if (timerStates[key].interval) {
+                clearInterval(timerStates[key].interval);
+                timerStates[key].interval = null;
+            }
+            stopAlarm(key);
+            timerStates[key].duration = normalized;
+            timerStates[key].remaining = normalized;
+            timerStates[key].running = false;
+            timerStates[key].lastTick = null;
+            timerStates[key].alarming = false;
+        }
+        return timerStates[key];
+    }
+
+    function getTimerDurationFromDom(key) {
+        const wrapper = document.querySelector(`[data-timer-wrapper="${key}"]`);
+        if (!wrapper) return 0;
+        const secs = parseFloat(wrapper.dataset.duration);
+        return isNaN(secs) ? 0 : Math.max(0, secs) * 1000;
+    }
+
+    function renderTimerDisplay(key) {
+        const display = document.querySelector(`[data-timer-display="${key}"]`);
+        if (!display) return;
+        const state = timerStates[key];
+        const baseMs = state ? state.remaining : getTimerDurationFromDom(key) || 0;
+        const secs = Math.max(0, Math.ceil(baseMs / 1000));
+        display.innerText = formatTimerClock(secs);
+    }
+
+    function startTimer(key) {
+        const durationMs = getTimerDurationFromDom(key) || undefined;
+        const state = ensureTimerState(key, durationMs);
+        if (!state.duration) {
+            alert('No duration set for this timer.');
+            return;
+        }
+        const startBtn = document.querySelector(`[data-timer-start="${key}"]`);
+        if (state.alarming) {
+            stopAlarm(key);
+            state.remaining = state.duration;
+            if (startBtn) startBtn.innerText = 'Start';
+            renderTimerDisplay(key);
+            return;
+        }
+        if (state.running) {
+            state.running = false;
+            if (state.interval) { clearInterval(state.interval); state.interval = null; }
+            if (startBtn) startBtn.innerText = 'Resume';
+            return;
+        }
+        if (state.remaining <= 0 || state.remaining > state.duration) state.remaining = state.duration;
+        state.running = true;
+        state.lastTick = Date.now();
+        if (startBtn) startBtn.innerText = 'Pause';
+        renderTimerDisplay(key);
+        state.interval = setInterval(() => tickTimer(key), 200);
+    }
+
+    function resetTimer(key) {
+        const state = ensureTimerState(key, getTimerDurationFromDom(key));
+        if (state.interval) { clearInterval(state.interval); state.interval = null; }
+        stopAlarm(key);
+        state.running = false;
+        state.remaining = state.duration;
+        state.lastTick = null;
+        const startBtn = document.querySelector(`[data-timer-start="${key}"]`);
+        if (startBtn) startBtn.innerText = 'Start';
+        renderTimerDisplay(key);
+    }
+
+    function tickTimer(key) {
+        const state = timerStates[key];
+        if (!state || !state.running) return;
+        const now = Date.now();
+        const delta = now - (state.lastTick || now);
+        state.lastTick = now;
+        state.remaining = Math.max(0, state.remaining - delta);
+        renderTimerDisplay(key);
+        if (state.remaining === 0) completeTimer(key);
+    }
+
+    function completeTimer(key) {
+        const state = timerStates[key];
+        if (!state) return;
+        state.running = false;
+        state.remaining = 0;
+        if (state.interval) { clearInterval(state.interval); state.interval = null; }
+        renderTimerDisplay(key);
+        const startBtn = document.querySelector(`[data-timer-start="${key}"]`);
+        if (startBtn) startBtn.innerText = 'Silence';
+        startAlarmLoop(key);
+    }
+
+    function startAlarmLoop(key) {
+        const state = timerStates[key];
+        if (!state) return;
+        stopAlarm(key);
+        state.alarming = true;
+        launchPersistentAlarmTone(state);
+    }
+
+    function stopAlarm(key) {
+        const state = timerStates[key];
+        if (!state) return;
+        state.alarming = false;
+        if (state.alarmInterval) {
+            clearInterval(state.alarmInterval);
+            state.alarmInterval = null;
+        }
+        if (state.alarmPulse) {
+            clearInterval(state.alarmPulse);
+            state.alarmPulse = null;
+        }
+        if (state.alarmSource) {
+            try { state.alarmSource.stop(); } catch (e) {}
+            state.alarmSource.disconnect();
+            state.alarmSource = null;
+        }
+        if (state.alarmGain) {
+            state.alarmGain.disconnect();
+            state.alarmGain = null;
+        }
+        const startBtn = document.querySelector(`[data-timer-start="${key}"]`);
+        if (startBtn && !state.running) startBtn.innerText = 'Start';
+    }
+
+    function launchPersistentAlarmTone(state) {
+        if (isTimerMuted()) return;
+        playTimerSound(true);
+        try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return;
+            timerAudioCtx = timerAudioCtx || new AudioCtx();
+            if (timerAudioCtx.state === 'suspended') timerAudioCtx.resume();
+
+            const profile = SOUND_PROFILES[getTimerSoundProfile()] || SOUND_PROFILES.classic;
+            const alarmFreqs = (profile.alarm && profile.alarm.length) ? profile.alarm : [880];
+            const osc = timerAudioCtx.createOscillator();
+            const gain = timerAudioCtx.createGain();
+            const now = timerAudioCtx.currentTime;
+            const baseVolume = getAlarmBaseVolume();
+
+            osc.type = profile.type || 'triangle';
+            osc.frequency.setValueAtTime(alarmFreqs[0], now);
+            gain.gain.setValueAtTime(0.0001, now);
+            gain.gain.linearRampToValueAtTime(baseVolume, now + 0.05);
+
+            osc.connect(gain);
+            gain.connect(timerAudioCtx.destination);
+            osc.start(now);
+
+            state.alarmSource = osc;
+            state.alarmGain = gain;
+            state.alarmBaseVolume = baseVolume;
+
+            const sweep = () => {
+                if (!state.alarmSource) return;
+                const base = timerAudioCtx.currentTime;
+                alarmFreqs.forEach((freq, idx) => {
+                    state.alarmSource.frequency.setValueAtTime(freq, base + idx * 0.25);
+                });
+            };
+            sweep();
+            state.alarmInterval = setInterval(sweep, 900);
+
+            const pulse = () => {
+                if (!state.alarmGain) return;
+                const base = timerAudioCtx.currentTime;
+                const surge = state.alarmBaseVolume || baseVolume;
+                state.alarmGain.gain.cancelScheduledValues(base);
+                state.alarmGain.gain.setValueAtTime(surge, base);
+                state.alarmGain.gain.linearRampToValueAtTime(surge * 0.35, base + 0.35);
+                state.alarmGain.gain.linearRampToValueAtTime(surge, base + 0.7);
+            };
+            pulse();
+            state.alarmPulse = setInterval(pulse, 650);
+        } catch (err) {
+            console.warn('Persistent alarm error', err);
+        }
+    }
+
+    function playTimerSound(isAlarm = false) {
+        if (isTimerMuted()) return;
+        try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return;
+            timerAudioCtx = timerAudioCtx || new AudioCtx();
+            if (timerAudioCtx.state === 'suspended') timerAudioCtx.resume();
+            const profile = SOUND_PROFILES[getTimerSoundProfile()] || SOUND_PROFILES.classic;
+            const freqs = (isAlarm ? profile.alarm : profile.normal) || [880];
+            const osc = timerAudioCtx.createOscillator();
+            const gain = timerAudioCtx.createGain();
+            const now = timerAudioCtx.currentTime;
+            const volume = getTimerVolume() / 100;
+            const gainLevel = Math.max(0.05, Math.min(0.6, volume * (isAlarm ? 0.45 : 0.3)));
+            osc.type = profile.type || 'triangle';
+            const step = 0.18;
+            freqs.forEach((freq, idx) => {
+                osc.frequency.setValueAtTime(freq, now + (idx * step));
+            });
+            const duration = Math.max(0.35, (freqs.length * step) + 0.25);
+            gain.gain.setValueAtTime(gainLevel, now);
+            gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+            osc.connect(gain);
+            gain.connect(timerAudioCtx.destination);
+            osc.start(now);
+            osc.stop(now + duration);
+        } catch (err) {
+            console.warn('Timer sound error', err);
+        }
+    }
+
+    // =============================
+    // Quick-win helpers: autosave, CSV export, keyboard shortcuts, expand/collapse, modal focus
+    // =============================
+    function attachInputHandlers() {
+        // restore any saved inputs for this tab
+        restoreAutosave();
+
+        // delegate input events
+        document.querySelectorAll('.actual-input').forEach(inp => {
+            inp.removeEventListener('input', saveActualInput);
+            inp.addEventListener('input', saveActualInput);
+        });
+        // Add autosave & syncing for strength controls
+        document.querySelectorAll('.strength-input').forEach(sel => {
+            sel.removeEventListener('change', strengthSelectListener);
+            sel.addEventListener('change', strengthSelectListener);
+            if (sel.dataset.id) syncStrengthDisplay(sel.dataset.id, sel.value || '0');
+        });
+        document.querySelectorAll('.strength-slider').forEach(slider => {
+            slider.removeEventListener('input', strengthSliderListener);
+            slider.addEventListener('input', strengthSliderListener);
+        });
+
+        // ensure check-circles are keyboard friendly (already have tabindex) and add focus styling
+        document.querySelectorAll('.check-circle').forEach(c => {
+            c.addEventListener('keydown', (e) => {
+                if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleCheck(c); }
+            });
+        });
+        // make Check All controls keyboard-activatable
+        document.querySelectorAll('.check-all-btn').forEach(b => {
+            b.addEventListener('keydown', (e) => {
+                if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleAllChecks(b); }
+            });
+        });
+        // update expand toggle button label to reflect current state
+        updateExpandToggleText();
+    }
+
+    function saveActualInput(e) {
+        const inp = e.target;
+        const id = inp.dataset.id || (inp.closest('tr') && inp.closest('tr').getAttribute('data-id'));
+        if (!id) return;
+        const key = 'autosave_' + activeTab;
+        const obj = JSON.parse(localStorage.getItem(key) || '{}');
+        obj[id] = inp.value;
+        localStorage.setItem(key, JSON.stringify(obj));
+    }
+
+    function restoreAutosave() {
+        const key = 'autosave_' + activeTab;
+        const obj = JSON.parse(localStorage.getItem(key) || '{}');
+        if (obj) {
+            document.querySelectorAll('.actual-input').forEach(inp => {
+                const id = inp.dataset.id;
+                if (id && obj[id] !== undefined) inp.value = obj[id];
+            });
+        }
+        // Restore strength dropdowns
+        const skey = 'autosave_strength_' + activeTab;
+        const sobj = JSON.parse(localStorage.getItem(skey) || '{}');
+        document.querySelectorAll('.strength-input').forEach(sel => {
+            const id = sel.dataset.id;
+            if (!id) return;
+            if (sobj && sobj[id] !== undefined) sel.value = sobj[id];
+            syncStrengthDisplay(id, sel.value || '0');
+        });
+    }
+
+    function exportHistoryCSV() {
+        const hist = JSON.parse(localStorage.getItem('workout_history') || '[]');
+        if (!hist.length) return alert('No history to export');
+        const lines = [];
+        lines.push(['date','day','exercise','target','actual','strength'].join(','));
+        hist.forEach(h => {
+            h.sets.forEach(s => {
+                const row = [h.date, '"' + h.day.replace(/"/g,'""') + '"', '"' + String(s.ex).replace(/"/g,'""') + '"', String(s.target), String(s.actual), (s.strength !== undefined ? s.strength : '')];
+                lines.push(row.join(','));
+            });
+        });
+        const csv = lines.join('\n');
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'workout_history.csv';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+    }
+
+    // ---------- CSV IMPORT FOR HISTORY ----------
+    function triggerImportHistory() {
+        const inp = document.getElementById('importHistoryInput');
+        if (!inp) return alert('Import input not found');
+        inp.value = null; // reset so same file can be reselected
+        inp.click();
+    }
+
+    function handleHistoryFileChange(e) {
+        const f = e.target.files && e.target.files[0];
+        if (!f) return;
+        const reader = new FileReader();
+        reader.onload = function(ev) {
+            try {
+                const text = ev.target.result;
+                importHistoryCSV(text);
+            } catch (err) {
+                alert('Failed to import CSV: ' + err.message);
+            }
+        };
+        reader.readAsText(f);
+    }
+
+    function parseCSV(text) {
+        const rows = [];
+        let cur = '';
+        let row = [];
+        let inQuotes = false;
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            if (inQuotes) {
+                if (ch === '"') {
+                    if (text[i+1] === '"') { cur += '"'; i++; }
+                    else { inQuotes = false; }
+                } else {
+                    cur += ch;
+                }
+            } else {
+                if (ch === '"') { inQuotes = true; }
+                else if (ch === ',') { row.push(cur); cur = ''; }
+                else if (ch === '\r') { /* ignore */ }
+                else if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
+                else { cur += ch; }
+            }
+        }
+        // trailing
+        if (inQuotes) throw new Error('Malformed CSV: unmatched quote');
+        if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+        return rows;
+    }
+
+    function importHistoryCSV(text) {
+        const rows = parseCSV(text).map(r => r.map(c => c.trim()));
+        if (!rows.length) return alert('CSV empty');
+
+        // detect header
+        const header = rows[0].map(h => h.toLowerCase());
+        let dataRows = rows;
+        let hasHeader = false;
+        if (header.includes('date') || header.includes('exercise') || header.includes('actual')) {
+            hasHeader = true;
+            dataRows = rows.slice(1);
+        }
+
+        // determine column indexes (fall back to expected order)
+        const cols = hasHeader ? header : ['date','day','exercise','target','actual'];
+        const idx = {
+            date: cols.indexOf('date'),
+            day: cols.indexOf('day'),
+            ex: cols.indexOf('exercise'),
+            target: cols.indexOf('target'),
+            actual: cols.indexOf('actual')
+        };
+        // if header didn't include 'day' but has 5 columns in order, assume positions
+        if (!hasHeader && dataRows[0] && dataRows[0].length >= 5) {
+            idx.date = 0; idx.day = 1; idx.ex = 2; idx.target = 3; idx.actual = 4;
+        }
+
+        const sessionsMap = {};
+        let importedCount = 0;
+        dataRows.forEach(r => {
+            if (!r || r.length === 0) return;
+            const date = (r[idx.date] || '').trim();
+            const day = (idx.day >= 0 ? (r[idx.day] || '') : '') .trim();
+            const ex = (r[idx.ex] || '').trim();
+            const target = (idx.target >= 0 ? (r[idx.target] || '') : '').trim();
+            const actual = (idx.actual >= 0 ? (r[idx.actual] || '') : '').trim();
+            if (!ex) return; // skip empty exercise rows
+            const key = (date || '') + '|' + (day || '');
+            if (!sessionsMap[key]) sessionsMap[key] = { date: date || new Date().toLocaleDateString(), day: day || '', sets: [] };
+            sessionsMap[key].sets.push({ ex: ex, target: target, actual: actual });
+            importedCount++;
+        });
+
+        const importedSessions = Object.values(sessionsMap);
+        if (!importedSessions.length) return alert('No valid rows found in CSV');
+
+        const existing = JSON.parse(localStorage.getItem('workout_history') || '[]');
+        const append = confirm(`Imported ${importedCount} rows across ${importedSessions.length} sessions. Click OK to append to existing history, Cancel to replace it.`);
+        let out = [];
+        if (append) out = importedSessions.concat(existing);
+        else out = importedSessions;
+
+        localStorage.setItem('workout_history', JSON.stringify(out));
+        alert('Import complete: ' + importedSessions.length + ' sessions');
+        // refresh history view
+        showHistory();
+    }
+
+    function expandAllSections() { document.querySelectorAll('.workout-section').forEach(s => s.classList.remove('collapsed')); }
+    function collapseAllSections() { document.querySelectorAll('.workout-section').forEach(s => s.classList.add('collapsed')); }
+
+    function toggleExpandToggle() {
+        const anyCollapsed = document.querySelectorAll('.workout-section.collapsed').length > 0;
+        if (anyCollapsed) {
+            expandAllSections();
+            document.getElementById('expandToggleBtn').innerText = 'Collapse All';
+        } else {
+            collapseAllSections();
+            document.getElementById('expandToggleBtn').innerText = 'Expand All';
+        }
+    }
+
+    function updateExpandToggleText() {
+        const btn = document.getElementById('expandToggleBtn');
+        if (!btn) return;
+        const anyCollapsed = document.querySelectorAll('.workout-section.collapsed').length > 0;
+        btn.innerText = anyCollapsed ? 'Expand All' : 'Collapse All';
+    }
+
+    function openModal(id) {
+        const m = document.getElementById(id);
+        if (!m) return;
+        m.style.display = 'flex';
+        m.setAttribute('aria-hidden', 'false');
+        const content = m.querySelector('.modal-content');
+        if (content) content.focus();
+        trapModalFocus(m);
+    }
+
+    function closeModal(id) {
+        const m = document.getElementById(id);
+        if (!m) return;
+        m.style.display = 'none';
+        m.setAttribute('aria-hidden', 'true');
+        untrapModalFocus(m);
+    }
+
+    let _modalKeyHandler = null;
+    function trapModalFocus(modal) {
+        _modalKeyHandler = function(e) {
+            if (e.key === 'Escape') { closeModal(modal.id); }
+            if (e.key === 'Tab') {
+                const focusables = modal.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+                if (!focusables.length) { e.preventDefault(); return; }
+                const first = focusables[0];
+                const last = focusables[focusables.length-1];
+                if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+                else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+            }
+        };
+        document.addEventListener('keydown', _modalKeyHandler);
+    }
+
+    function untrapModalFocus(modal) { if (_modalKeyHandler) document.removeEventListener('keydown', _modalKeyHandler); _modalKeyHandler = null; }
+
+    // Wire showPlates/showHistory to open modals with new helpers
+    const _origShowPlates = showPlates;
+    showPlates = function(txt) { _origShowPlates(txt); openModal('plateModal'); };
+
+    const _origShowHistory = showHistory;
+    showHistory = function() { 
+        _origShowHistory(); 
+        openModal('historyModal'); 
+        // ensure history modal uses the fullscreen modal styles (matches Graphs/Settings)
+        const _histModal = document.getElementById('historyModal');
+        if (_histModal) _histModal.classList.add('fullscreen');
+        // behave like a full-page overlay: hide top chrome and prevent body scroll
+        const nav = document.querySelector('.navbar');
+        const weeks = document.getElementById('navWeeks');
+        const wd = document.getElementById('workoutDisplay');
+        const gv = document.getElementById('graphView');
+        window._prevView = (gv && gv.style.display !== 'none') ? 'graph' : 'workout';
+        if (wd) wd.style.display = 'none';
+        if (gv) gv.style.display = 'none';
+        if (nav) nav.style.display = 'none';
+        if (weeks) weeks.style.display = 'none';
+        document.body.style.overflow = 'hidden';
+    };
+
+    // Global shortcuts (g = graphs toggle, h = history, / = focus search (if exists))
+    document.addEventListener('keydown', (e) => {
+        if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable)) return;
+        if (e.key === 'g') { e.preventDefault(); toggleGraphView(); }
+        if (e.key === 'h') { e.preventDefault(); showHistory(); }
+    });
+
+    function closeHistoryView() {
+        // remove fullscreen flag then close
+        const _histModalClose = document.getElementById('historyModal');
+        if (_histModalClose) _histModalClose.classList.remove('fullscreen');
+        closeModal('historyModal');
+        const nav = document.querySelector('.navbar');
+        const weeks = document.getElementById('navWeeks');
+        const wd = document.getElementById('workoutDisplay');
+        const gv = document.getElementById('graphView');
+        // restore previous view
+        if (window._prevView === 'graph' && gv) {
+            gv.style.display = 'block';
+            gv.classList.add('overlay');
+            if (wd) wd.style.display = 'none';
+        } else {
+            if (wd) wd.style.display = 'block';
+            if (gv) gv.style.display = 'none';
+            gv.classList.remove('overlay');
+        }
+        if (nav) nav.style.display = '';
+        if (weeks) weeks.style.display = '';
+        document.body.style.overflow = '';
+    }
+
+    function closeGraphView() {
+        const gDisplay = document.getElementById('graphView');
+        const wDisplay = document.getElementById('workoutDisplay');
+        const nav = document.querySelector('.navbar');
+        const weeks = document.getElementById('navWeeks');
+        if (!gDisplay) return;
+        // hide overlay
+        gDisplay.classList.remove('overlay');
+        gDisplay.style.display = 'none';
+        // restore previous view
+        if (window._prevView === 'graph') {
+            // if graph was previous, nothing to show
+        }
+        if (wDisplay) wDisplay.style.display = 'block';
+        if (nav) nav.style.display = '';
+        if (weeks) weeks.style.display = '';
+        document.body.style.overflow = '';
+    }
+
+    // After rendering new tab content, call attachInputHandlers
+    const _origLoadTab = loadTab;
+    loadTab = function(tabName) {
+        _origLoadTab(tabName);
+        // when sheet script inserts rows it will call processSheet -> recalculateAll -> updateSectionProgress
+        // schedule a small delay to attach inputs after rows are built
+        setTimeout(() => { attachInputHandlers(); }, 600);
+    };
+
+    // ==========================================
+    // 📊 NEW COMBO GRAPH LOGIC (3 CHARTS)
+    // ==========================================
+    function toggleGraphView() {
+        const wDisplay = document.getElementById('workoutDisplay');
+        const gDisplay = document.getElementById('graphView');
+        const nav = document.querySelector('.navbar');
+        const weeks = document.getElementById('navWeeks');
+        if (!gDisplay) return;
+
+        if (gDisplay.classList.contains('overlay')) {
+            // closing overlay
+            gDisplay.classList.remove('overlay');
+            gDisplay.style.display = 'none';
+            if (window._prevView === 'graph') {
+                // if graph was previous, keep it hidden
+            }
+            if (wDisplay) wDisplay.style.display = 'block';
+            if (nav) nav.style.display = '';
+            if (weeks) weeks.style.display = '';
+            document.body.style.overflow = '';
+        } else {
+            // opening overlay
+            window._prevView = (gDisplay.style.display !== 'none') ? 'graph' : 'workout';
+            if (wDisplay) wDisplay.style.display = 'none';
+            if (gDisplay) gDisplay.style.display = 'block';
+            gDisplay.classList.add('overlay');
+            if (nav) nav.style.display = 'none';
+            if (weeks) weeks.style.display = 'none';
+            document.body.style.overflow = 'hidden';
+            loadFullProgramData();
+        }
+    }
+
+    async function loadFullProgramData() {
+        if (fullProgramCache) { renderGraphs(fullProgramCache); return; }
+        if (!allTabNames.length) return;
+
+        document.getElementById('graphLoader').style.display = 'block';
+
+        const tabsToFetch = allTabNames.slice(0, 16); 
+        const ranges = tabsToFetch.map(t => `ranges=${encodeURIComponent(t)}!A:E`).join('&');
+        
+        try {
+            const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values:batchGet?${ranges}&key=${API_KEY}`);
+            const json = await res.json();
+            
+            if (!json.valueRanges) throw new Error("No data returned");
+
+            const results = {}; 
+            
+            json.valueRanges.forEach(rangeObj => {
+                const fullTitle = rangeObj.range; 
+                const tabName = fullTitle.split('!')[0].replace(/'/g, "");
+                
+                const rows = rangeObj.values;
+                if(!rows) return;
+
+                let maxS = 0, maxB = 0, maxD = 0;
+                let volS = 0, volB = 0, volD = 0;
+                
+                rows.forEach(r => {
+                    if(!r[0]) return;
+                    const name = r[0].toLowerCase();
+                    const sets = parseInt(r[1]) || 0;
+                    const reps = parseInt(r[2]) || 0;
+                    const rpeStr = String(r[3]).trim();
+                    
+                    if (name.includes('exercise')) return;
+                    
+                    let pct = 0;
+                    let rpeVal = parseFloat(rpeStr.replace(/[^0-9.]/g, ''));
+                    if(rpeStr.includes('%') || rpeVal > 10) pct = rpeVal / 100;
+                    else if(RPE_CHART[reps] && RPE_CHART[reps][rpeVal]) pct = RPE_CHART[reps][rpeVal];
+                    if(isNaN(pct)) pct = 0;
+                    
+                    if (pct > 0) {
+                        let w = 0;
+                        if (name.includes('squat')) {
+                            w = parseFloat(localStorage.getItem('1rm_Squat')||100) * pct;
+                            if(w > maxS) maxS = w;
+                            volS += (sets * reps * w);
+                        } else if (name.includes('bench')) {
+                            w = parseFloat(localStorage.getItem('1rm_Bench Press')||100) * pct;
+                            if(w > maxB) maxB = w;
+                            volB += (sets * reps * w);
+                        } 
+                        else if (name.includes('deadlift') || name.match(/\bdl\b/) || name.includes('pull')) {
+                            w = parseFloat(localStorage.getItem('1rm_Deadlift')||100) * pct;
+                            if(w > maxD) maxD = w;
+                            volD += (sets * reps * w);
+                        }
+                    }
+                });
+
+                const stepStr = localStorage.getItem('round_step') || '0.5';
+                const roundStep = parseFloat(stepStr);
+                results[tabName] = { 
+                    s: maxS > 0 ? (stepStr === 'none' ? maxS : Math.round(maxS/roundStep)*roundStep) : 0, 
+                    b: maxB > 0 ? (stepStr === 'none' ? maxB : Math.round(maxB/roundStep)*roundStep) : 0, 
+                    d: maxD > 0 ? (stepStr === 'none' ? maxD : Math.round(maxD/roundStep)*roundStep) : 0,
+                    volS: volS > 0 ? Math.round(volS) : 0,
+                    volB: volB > 0 ? Math.round(volB) : 0,
+                    volD: volD > 0 ? Math.round(volD) : 0
+                };
+            });
+
+            fullProgramCache = { tabs: tabsToFetch, data: results };
+            renderGraphs(fullProgramCache);
+            document.getElementById('graphLoader').style.display = 'none';
+
+        } catch(e) {
+            console.error(e);
+            alert("Could not load full program: " + e.message);
+        }
+    }
+
+    function renderGraphs(programData) {
+        const labels = programData.tabs; 
+        
+        // 1. DATA PREP (Fill Forward)
+        const buildSeries = (key) => {
+            const arr = [];
+            labels.forEach(l => arr.push(programData.data[l] ? programData.data[l][key] : 0));
+            let firstVal = 0;
+            for(let i=0; i<arr.length; i++) { if(arr[i] > 0) { firstVal = arr[i]; break; } }
+            let lastVal = firstVal;
+            return arr.map(val => { if (val > 0) { lastVal = val; return val; } else { return lastVal; } });
+        };
+
+        const tgtS = buildSeries('s');
+        const tgtB = buildSeries('b');
+        const tgtD = buildSeries('d');
+        const vS = buildSeries('volS');
+        const vB = buildSeries('volB');
+        const vD = buildSeries('volD');
+
+        // Actuals
+        const hist = JSON.parse(localStorage.getItem('workout_history') || '[]');
+        const actS = new Array(labels.length).fill(null);
+        const actB = new Array(labels.length).fill(null);
+        const actD = new Array(labels.length).fill(null);
+
+        // Strength (average per day)
+        const strengthVals = new Array(labels.length).fill(null);
+
+        hist.forEach(h => {
+            const idx = labels.indexOf(h.day); 
+            if (idx !== -1) {
+                let strengthSum = 0, strengthCount = 0;
+                h.sets.forEach(s => {
+                    const val = parseFloat(s.actual);
+                    if (!val) return;
+                    const n = s.ex.toLowerCase();
+                    if (n.includes('squat') && val > (actS[idx]||0)) actS[idx] = val;
+                    if (n.includes('bench') && val > (actB[idx]||0)) actB[idx] = val;
+                    if (n.includes('deadlift') && val > (actD[idx]||0)) actD[idx] = val;
+                    // Strength
+                    if (s.strength !== undefined && s.strength !== null && s.strength !== "") {
+                        strengthSum += parseInt(s.strength);
+                        strengthCount++;
+                    }
+                });
+                if (strengthCount > 0) strengthVals[idx] = strengthSum / strengthCount;
+            }
+        });
+
+        // 2. HELPER TO CREATE DUAL AXIS CHARTS
+        const createDualChart = (ctxId, label, color, tgtData, actData, volData) => {
+            const ctx = document.getElementById(ctxId).getContext('2d');
+            if (charts[ctxId]) charts[ctxId].destroy();
+            charts[ctxId] = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        { 
+                            label: 'Volume (Right)', 
+                            data: volData, 
+                            type: 'bar',
+                            yAxisID: 'y1', 
+                            backgroundColor: color,
+                            borderColor: color,
+                            borderWidth: 1,
+                            barPercentage: 0.5
+                        },
+                        { 
+                            label: 'Target Weight (Left)', 
+                            data: tgtData, 
+                            borderColor: color, 
+                            borderDash: [5,5], 
+                            pointRadius: 4, 
+                            pointHitRadius: 20, 
+                            tension: 0.2, 
+                            yAxisID: 'y' 
+                        },
+                        { 
+                            label: 'Actual Weight (Left)', 
+                            data: actData, 
+                            borderColor: '#ffffff', // WHITE ACTUAL LINE
+                            backgroundColor: '#ffffff', 
+                            pointRadius: 6, 
+                            pointHitRadius: 20, 
+                            spanGaps: true, 
+                            yAxisID: 'y' 
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: { tooltip: { enabled: true, mode: 'index', intersect: false } },
+                    scales: {
+                        y: { 
+                            type: 'linear', 
+                            display: true, 
+                            position: 'left', 
+                            beginAtZero: true, // START AT 0
+                            title: {display: true, text: 'Max Weight (kg)'},
+                            grid: { color: '#334155' }
+                        },
+                        y1: { 
+                            type: 'linear', 
+                            display: true, 
+                            position: 'right', 
+                            beginAtZero: true,
+                            title: {display: true, text: 'Volume (kg)'},
+                            grid: { drawOnChartArea: false } // clean look
+                        }
+                    }
+                }
+            });
+        };
+
+        // Strength chart (single line, y: -2 to +2)
+        const ctxStrength = document.getElementById('strengthChart').getContext('2d');
+        if (charts['strengthChart']) charts['strengthChart'].destroy();
+        charts['strengthChart'] = new Chart(ctxStrength, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'Avg Strength',
+                        data: strengthVals,
+                        borderColor: '#f59e42',
+                        backgroundColor: '#f59e42',
+                        pointRadius: 6,
+                        pointHitRadius: 20,
+                        spanGaps: true,
+                        tension: 0.2,
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: { tooltip: { enabled: true, mode: 'index', intersect: false } },
+                scales: {
+                    y: {
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        min: -2,
+                        max: 2,
+                        title: {display: true, text: 'Strength (-2=Hard, 0=Normal, +2=Good)'},
+                        grid: { color: '#334155' }
+                    }
+                }
+            }
+        });
+
+        createDualChart('sqChart', 'Squat', '#ef4444', tgtS, actS, vS);
+        createDualChart('bpChart', 'Bench', '#3b82f6', tgtB, actB, vB);
+        createDualChart('dlChart', 'Deadlift', '#22c55e', tgtD, actD, vD);
+    }
+</script>
+</body>
+</html>
